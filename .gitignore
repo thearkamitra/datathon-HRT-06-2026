@@ -75,6 +75,8 @@ dmypy.json
 
 .python-version
 
+# Competition output (regenerate with scripts/train_predict.py or Submissions/generate_submission.py)
+Submissions/submission.csv
 
 # uv.lock
 uv.lock

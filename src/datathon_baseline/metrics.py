@@ -30,3 +30,14 @@ def sharpe_for_scalar_alpha(
     """Train-time Sharpe when w_i = alpha * f_i."""
     w = alpha * np.asarray(signal, dtype=np.float64)
     return sharpe(pnl_from_positions(w, realized_returns))
+
+
+def neg_sharpe_linear(
+    beta: np.ndarray,
+    X_design: np.ndarray,
+    R: np.ndarray,
+) -> float:
+    """Loss = minus train Sharpe for pnl_i = R_i * (X_design @ beta)_i."""
+    w = X_design @ beta
+    pnl = pnl_from_positions(w, R)
+    return -float(sharpe(pnl))

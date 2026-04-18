@@ -16,13 +16,17 @@ dependencies = [
     "matplotlib>=3.9.4",
     "transformers>=4.57.6",
     "torch>=2.8.0",
+    "scipy>=1.10",
+    "streamlit>=1.32",
+    "plotly>=5.18",
+    "kaleido>=0.2",
 ]
 
 [project.scripts]
 headline-analyzer = "src.main:main"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest",
     "black",
     "isort",
