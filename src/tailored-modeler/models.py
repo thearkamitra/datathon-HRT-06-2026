@@ -225,7 +225,24 @@ class TabularHeads:
         y: np.ndarray,
         X_val: Optional[pd.DataFrame] = None,
         y_val: Optional[np.ndarray] = None,
+        n_iters_override: Optional[Dict[str, int]] = None,
     ) -> "TabularHeads":
+        """Fit the three heads.
+
+        Parameters
+        ----------
+        X, y:
+            Training matrix and R-target. All ``len(X)`` rows are used for
+            training; early stopping never uses them as val.
+        X_val, y_val:
+            Optional held-out set used only for LightGBM early stopping. If
+            not supplied, each head trains for exactly ``n_iters_override[key]``
+            rounds (or ``hyper.n_estimators`` if no override). This lets the
+            pipeline do a full-train refit with the CV-averaged best-iter.
+        n_iters_override:
+            Optional dict mapping ``'mean' | 'sign' | 'qNN'`` -> fixed
+            ``num_boost_round``. Used for the full-train production refit.
+        """
         self.feature_names_ = list(X.columns)
         X_ = X.to_numpy(dtype=np.float64)
         y_ = np.asarray(y, dtype=np.float64)
@@ -236,11 +253,22 @@ class TabularHeads:
         y_va_np = np.asarray(y_val, dtype=np.float64) if y_val is not None else None
         sign_va = (y_va_np > 0).astype(np.int32) if y_va_np is not None else None
 
+        def _n(key: str) -> int:
+            if n_iters_override is not None and key in n_iters_override:
+                return max(1, int(n_iters_override[key]))
+            return int(self.hyper.n_estimators)
+
+        def _es(key: str) -> int:
+            # Disable early stopping when a fixed round count is requested.
+            if n_iters_override is not None and key in n_iters_override:
+                return 0
+            return int(self.hyper.early_stopping_rounds)
+
         if _HAS_LGB:
             mean_params = _lgb_params("huber", None, self.random_state, self.hyper)
             self.mean_model_ = _fit_lgb(
                 mean_params, X_, y_, X_va_np, y_va_np,
-                self.hyper.n_estimators, self.hyper.early_stopping_rounds, sw,
+                _n("mean"), _es("mean"), sw,
             )
             self.best_iters_["mean"] = int(
                 self.mean_model_.best_iteration or self.mean_model_.current_iteration()
@@ -250,7 +278,7 @@ class TabularHeads:
             self.sign_model_ = _fit_lgb(
                 sign_params, X_, sign_y.astype(np.float64), X_va_np,
                 sign_va.astype(np.float64) if sign_va is not None else None,
-                self.hyper.n_estimators, self.hyper.early_stopping_rounds, sw,
+                _n("sign"), _es("sign"), sw,
             )
             self.best_iters_["sign"] = int(
                 self.sign_model_.best_iteration or self.sign_model_.current_iteration()
@@ -258,13 +286,14 @@ class TabularHeads:
 
             self.quantile_models_ = {}
             for qi, q in enumerate(self.quantiles):
+                key = f"q{int(q * 100):02d}"
                 qp = _lgb_params("quantile", q, self.random_state + 101 + qi, self.hyper)
                 booster = _fit_lgb(
                     qp, X_, y_, X_va_np, y_va_np,
-                    self.hyper.n_estimators, self.hyper.early_stopping_rounds, sw,
+                    _n(key), _es(key), sw,
                 )
                 self.quantile_models_[float(q)] = booster
-                self.best_iters_[f"q{int(q * 100):02d}"] = int(
+                self.best_iters_[key] = int(
                     booster.best_iteration or booster.current_iteration()
                 )
         elif _HAS_XGB:  # pragma: no cover - fallback
@@ -353,6 +382,7 @@ class TabularHeads:
         q_oof = {float(q): np.zeros(n, dtype=np.float64) for q in self.quantiles}
         counts = np.zeros(n, dtype=np.float64)
         fold_groups = np.full(n, -1, dtype=np.int64)
+        per_fold_iters: Dict[str, List[int]] = {}
 
         splitter = (
             RepeatedKFold(n_splits=n_splits, n_repeats=n_repeats, random_state=self.random_state)
@@ -377,6 +407,8 @@ class TabularHeads:
                 X_val=X.iloc[va],
                 y_val=y_[va],
             )
+            for k, v in heads.best_iters_.items():
+                per_fold_iters.setdefault(k, []).append(int(v))
             preds = heads.predict(X.iloc[va])
             mu_oof[va] += preds["mu"].to_numpy()
             p_oof[va] += preds["p_up"].to_numpy()
@@ -408,6 +440,12 @@ class TabularHeads:
                 "u": u,
             }
         )
+        # Aggregate per-fold best-iter counts (median is more robust than mean
+        # when early stopping sometimes fires early on a noisy validation fold).
+        avg_iters = {
+            k: int(max(1, np.median(v))) for k, v in per_fold_iters.items() if v
+        }
+        self.best_iters_ = avg_iters
         if return_folds:
             return preds_df, fold_groups
         return preds_df

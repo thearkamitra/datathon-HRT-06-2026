@@ -70,10 +70,17 @@ class TailoredResult:
     config: TailoredConfig
 
 
-def _merge_news(features: pd.DataFrame, config: NewsConfig) -> pd.DataFrame:
-    if not config.enabled:
-        return features
-    news_feats = build_news_features(features["session"], config)
+def _merge_news(
+    features: pd.DataFrame,
+    config: NewsConfig,
+    data_dir: Path,
+    splits: tuple[str, ...],
+) -> pd.DataFrame:
+    news_feats = build_news_features(
+        features["session"], config, data_dir=data_dir, splits=splits,
+    )
+    # When disabled this is a zero-filled frame; we still merge to keep the
+    # columns present so feature_columns() sees a consistent schema.
     return features.merge(news_feats, on="session", how="left")
 
 
@@ -86,7 +93,8 @@ def run_pipeline(
     # ---- Train features + labels ------------------------------------------
     bars_tr = pd.read_parquet(data_dir / BARS_SEEN_TRAIN)
     feats_tr = build_session_features(bars_tr)
-    feats_tr = _merge_news(feats_tr, config.news)
+    if config.news.enabled:
+        feats_tr = _merge_news(feats_tr, config.news, data_dir, ("train_seen",))
 
     labels = train_realized_returns(data_dir)
     feats_tr = feats_tr.merge(labels[["session", "R"]], on="session", how="inner")
@@ -131,24 +139,20 @@ def run_pipeline(
     edge_raw = oof_preds["mu"].to_numpy() * (2.0 * oof_preds["p_up"].to_numpy() - 1.0)
     edge_only_sharpe = sharpe(edge_raw * y_tr)
 
-    # ---- Final retrain on full train (no validation -> keep best_iter) ----
+    # ---- Final retrain on ALL 1000 train sessions using CV-median best-iter
+    # (Previous version trained on only 80% of the data via a single KFold
+    # split, wasting 200 labelled sessions and biasing the final model.)
+    cv_best_iters = dict(heads_proto.best_iters_)
     final_heads = TabularHeads(
         random_state=config.random_state,
         quantiles=config.quantiles,
         hyper=config.hyper,
         sample_weights=config.sample_weights,
     )
-    # Use a single fold-like split for early stopping on the final retrain,
-    # which gives honest best_iteration numbers without training on val.
-    from sklearn.model_selection import KFold
-
-    kf = KFold(n_splits=5, shuffle=True, random_state=config.random_state + 777)
-    tr_idx, va_idx = next(iter(kf.split(X_tr)))
     final_heads.fit(
-        X_tr.iloc[tr_idx],
-        y_tr[tr_idx],
-        X_val=X_tr.iloc[va_idx],
-        y_val=y_tr[va_idx],
+        X_tr, y_tr,
+        X_val=None, y_val=None,
+        n_iters_override=cv_best_iters if cv_best_iters else None,
     )
 
     feat_importance = final_heads.feature_importance()
@@ -158,7 +162,10 @@ def run_pipeline(
     bars_priv = pd.read_parquet(data_dir / BARS_SEEN_PRIVATE_TEST)
     bars_te = pd.concat([bars_pub, bars_priv], ignore_index=True)
     feats_te = build_session_features(bars_te)
-    feats_te = _merge_news(feats_te, config.news)
+    if config.news.enabled:
+        feats_te = _merge_news(
+            feats_te, config.news, data_dir, ("public_test", "private_test"),
+        )
     feats_te = feats_te.sort_values("session").reset_index(drop=True)
 
     X_te = feats_te[feat_cols].astype(np.float64)
@@ -207,7 +214,8 @@ def run_pipeline(
         "tuned_theta": float(tuned_cfg.theta),
         "tuned_tau_quantile": float(tuned_cfg.tau_quantile),
         "tune_info": tune_info,
-        "best_iters": dict(final_heads.best_iters_),
+        "cv_median_best_iters": cv_best_iters,
+        "final_train_size": int(len(X_tr)),
     }
     if adversarial is not None:
         diagnostics["adversarial_auc"] = float(adversarial.overall_auc)
