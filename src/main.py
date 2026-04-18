@@ -11,6 +11,7 @@ def main():
     parser.add_argument("--model", type=str, help="Model name (optional)")
     parser.add_argument("--sessions", type=int, help="Number of sessions to process (default: all sessions in file)")
     parser.add_argument("--limit", type=int, help="Headlines per session limit (default: all headlines in session)")
+    parser.add_argument("--batch-size", type=int, default=5, help="Number of headlines to batch in one LLM call (default: 5)")
     parser.add_argument("--input", type=str, default="data/headlines_seen_train.parquet", help="Input parquet file")
     parser.add_argument("--company", type=str, help="Specific company to report on (default: all identified companies)")
     parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers (default: 5)")
@@ -29,6 +30,7 @@ def main():
             session_limit=args.sessions,
             headline_limit=args.limit,
             max_workers=args.workers,
+            batch_size=args.batch_size,
             **predictor_kwargs
         )
         

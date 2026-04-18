@@ -10,6 +10,7 @@ def get_or_process_file(
     session_limit: Optional[int] = None, 
     headline_limit: Optional[int] = None,
     max_workers: int = 5,
+    batch_size: int = 5,
     **predictor_kwargs
 ) -> Processor:
     """
@@ -38,7 +39,8 @@ def get_or_process_file(
     processor.process_headlines(
         session_limit=session_limit, 
         headline_limit_per_session=headline_limit,
-        max_workers=max_workers
+        max_workers=max_workers,
+        batch_size=batch_size
     )
     
     # Save the results if we did some work

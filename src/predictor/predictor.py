@@ -29,6 +29,23 @@ class BasePredictor:
     def predict(self, prompt: str) -> str:
         raise NotImplementedError
     
+    def predict_json(self, prompt: str) -> Dict[str, Any]:
+        """
+        Request a JSON response from the model and return it as a dictionary.
+        """
+        raw = self.predict(prompt + "\nIMPORTANT: Your entire response must be a valid JSON object or list. Do not include any markdown formatting or explanations.")
+        try:
+            # Clean up potential markdown blocks
+            clean_raw = raw.strip()
+            if clean_raw.startswith("```json"):
+                clean_raw = clean_raw[7:]
+            if clean_raw.endswith("```"):
+                clean_raw = clean_raw[:-3]
+            return json.loads(clean_raw.strip())
+        except Exception as e:
+            print(f"Failed to parse JSON response: {raw[:200]}...")
+            raise e
+
     def get_model_name(self) -> str:
         raise NotImplementedError
 
@@ -49,13 +66,25 @@ class GeminiPredictor(BasePredictor):
         )
         return response.text
     
+    def predict_json(self, prompt: str) -> Dict[str, Any]:
+        self.rate_limiter.wait()
+        # Gemini 1.5+ supports constrained output
+        response = self.client.models.generate_content(
+            model=self.model_name,
+            contents=prompt,
+            config={
+                "response_mime_type": "application/json"
+            }
+        )
+        return json.loads(response.text)
+
     def get_model_name(self) -> str:
         return self.model_name
 
 class OllamaPredictor(BasePredictor):
-    def __init__(self, model_name: str = "llama3", host: str = "http://localhost:11434"):
-        self.model_name = model_name
-        self.host = host
+    def __init__(self, model_name: Optional[str] = None, host: Optional[str] = None):
+        self.model_name = model_name or os.getenv("OLLAMA_MODEL") or "llama3"
+        self.host = host or os.getenv("OLLAMA_HOST") or "http://localhost:11434"
 
     def predict(self, prompt: str) -> str:
         url = f"{self.host}/api/generate"
@@ -67,6 +96,18 @@ class OllamaPredictor(BasePredictor):
         response = requests.post(url, json=payload)
         response.raise_for_status()
         return response.json().get("response", "")
+
+    def predict_json(self, prompt: str) -> Dict[str, Any]:
+        url = f"{self.host}/api/generate"
+        payload = {
+            "model": self.model_name,
+            "prompt": prompt,
+            "stream": False,
+            "format": "json" # Ollama's native JSON mode
+        }
+        response = requests.post(url, json=payload)
+        response.raise_for_status()
+        return json.loads(response.json().get("response", "{}"))
     
     def get_model_name(self) -> str:
         return self.model_name

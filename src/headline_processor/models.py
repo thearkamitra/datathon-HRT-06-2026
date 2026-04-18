@@ -16,6 +16,64 @@ class Headline:
     def __repr__(self):
         return f"Headline(session={self.session}, bar_ix={self.bar_ix}, company={self.company}, sentiment={self.sentiment}, conf={self.confidence})"
 
+    @staticmethod
+    def predict_batch(predictor, headlines: List['Headline'], history_map: Dict[str, List['Headline']] = None):
+        """
+        Predicts sentiment for a batch of headlines in one call.
+        """
+        if not headlines:
+            return
+
+        headlines_data = []
+        for i, h in enumerate(headlines):
+            context_str = ""
+            # If we have a hint about company or global history, we might include it.
+            # However, for initial batching, we usually don't know the company yet.
+            # We can include general recent history for the session if needed.
+            
+            headlines_data.append({
+                "id": i,
+                "text": h.text,
+                "session": h.session,
+                "bar_ix": h.bar_ix
+            })
+
+        prompt = f"""
+        Analyze the following financial headlines for a synthetic stock market challenge.
+        For each headline:
+        1. Identify the primary company mentioned. If none, use "None".
+        2. Determine sentiment: "buy" or "sell".
+        3. Provide confidence (0.0 to 1.0).
+        4. Provide brief reasoning.
+
+        Headlines:
+        {json.dumps(headlines_data, indent=2)}
+
+        Respond with a JSON object containing a list called "results" with the same number of items as the input.
+        Each item should have: "id", "company", "sentiment", "confidence", "reasoning".
+        """
+
+        try:
+            response_data = predictor.predict_json(prompt)
+            results = response_data.get("results", [])
+            
+            for res in results:
+                idx = res.get("id")
+                if idx is not None and 0 <= idx < len(headlines):
+                    h = headlines[idx]
+                    h.company = res.get("company")
+                    if h.company == "None":
+                        h.company = None
+                    h.sentiment = res.get("sentiment")
+                    h.confidence = res.get("confidence")
+                    h.reasoning = res.get("reasoning")
+        except Exception as e:
+            print(f"Error in batch prediction: {e}")
+            # Fallback to individual if batch fails? Or just mark as failed.
+            for h in headlines:
+                if h.sentiment is None:
+                    h.reasoning = f"Batch prediction failed: {str(e)}"
+
     def predict_sentiment(self, predictor, history: List['Headline'] = None):
         """
         Predicts the sentiment (buy/sell) and identifies the company for this headline.
