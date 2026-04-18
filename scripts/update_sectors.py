@@ -69,11 +69,13 @@ def main():
     # 2. Map unique granular sectors to broad sectors in ONE call
     print(f"Mapping {len(all_unique_granular)} unique granular sectors using {args.provider}...")
     
-    prompt = f"""
-    Map the following granular industrial sectors to broad categories 
-    (e.g., Technology, Healthcare, Energy, Finance, Consumer Goods, Industrials, etc.).
+    allowed_sectors = ["Healthcare", "Finance", "Technology", "Consumer Goods", "Energy", "Industrials"]
     
-    Sectors: {", ".join(sorted(list(all_unique_granular)))}
+    prompt = f"""
+    Map the following granular industrial sectors to exactly ONE of these broad categories:
+    {", ".join(allowed_sectors)}
+    
+    Sectors to map: {", ".join(sorted(list(all_unique_granular)))}
     
     Respond with a JSON object where keys are granular sectors and values are broad categories.
     Example: {{"Biosciences": "Healthcare", "Renewables": "Energy"}}
@@ -81,15 +83,23 @@ def main():
     
     try:
         mapping = predictor.predict_json(prompt)
-        print("Mapping received:")
+        
+        # Post-process: Merge Industrials into Technology as requested
+        print("Mapping received (before merge):")
+        final_mapping = {}
         for k, v in mapping.items():
-            print(f"  {k} -> {v}")
+            if v == "Industrials":
+                target = "Technology"
+            else:
+                target = v
+            final_mapping[k] = target
+            print(f"  {k} -> {target} (originally {v})")
             
         # 3. Update dataframes and save
         for file_path, df in dfs.items():
             # Apply mapping to rows where sector is missing
             mask = df['sector'].isna()
-            df.loc[mask, 'sector'] = df.loc[mask, 'granular_sector'].map(mapping)
+            df.loc[mask, 'sector'] = df.loc[mask, 'granular_sector'].map(final_mapping)
             
             # Reorder columns to match the new standard
             cols = ['session', 'bar_ix', 'headline', 'company', 'granular_sector', 'sector', 'sentiment', 'sentiment_score', 'confidence']
