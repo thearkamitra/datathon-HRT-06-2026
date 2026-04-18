@@ -16,6 +16,9 @@ dependencies = [
     "matplotlib>=3.9.4",
     "transformers>=4.57.6",
     "torch>=2.8.0",
+    "scipy>=1.10",
+    "streamlit>=1.32",
+    "plotly>=5.18",
 ]
 
 [project.scripts]
