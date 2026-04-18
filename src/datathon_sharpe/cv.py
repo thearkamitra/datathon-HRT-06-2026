@@ -11,6 +11,7 @@ import pandas as pd
 from datathon_baseline.metrics import sharpe
 from datathon_baseline.predict import Method, TrainResult
 from datathon_sharpe.split import split_25_25
+from datathon_sharpe.sharpe_label_transforms import SharpeOptimizerLabel
 from datathon_sharpe.train_model import fit_full_train_and_submission
 
 
@@ -38,12 +39,17 @@ def run_cv_report(
     data_dir: Path,
     method: Method,
     *,
-    ridge_reg: float = 5.0,
-    l1_ratio: float = 0.15,
+    ridge_reg: float = 1.0,
+    l1_ratio: float = 0.0,
     random_state: int = 0,
     split_seed: int | None = None,
     within_session_split: bool = False,
     augment_test_with_proxy: bool = True,
+    sharpe_optimizer_label: SharpeOptimizerLabel = "identity",
+    use_cnn: bool = False,
+    cnn_epochs: int = 40,
+    mse_anchor_lambda: float = 0.0,
+    distributional_policy: str = "prob_sign",
 ) -> tuple[pd.DataFrame, CVReport]:
     """
     1) Fit on **all** training sessions (with labels).
@@ -59,6 +65,11 @@ def run_cv_report(
 
     Realized returns `R` are only available for train sessions (not for public/private
     test ids), so the 25+25 Sharpe uses train session ids only.
+
+    ``mse_anchor_lambda``: Sharpe-linear only; passed to ``fit_full_train_and_submission``
+    (0 = unit-sphere Sharpe; >0 adds MSE anchor to Ridge positions).
+
+    ``distributional_policy``: ``distributional_mono`` only (``prob_sign``, ``quantile_median``, ``rank_score``).
     """
     from datathon_sharpe.split import train_session_pool
 
@@ -74,6 +85,11 @@ def run_cv_report(
         random_state=random_state,
         within_session_split=within_session_split,
         augment_test_with_proxy=augment_test_with_proxy,
+        sharpe_optimizer_label=sharpe_optimizer_label,
+        use_cnn=use_cnn,
+        cnn_epochs=cnn_epochs,
+        mse_anchor_lambda=mse_anchor_lambda,
+        distributional_policy=distributional_policy,
     )
     sh_a = _sharpe_on_sessions(pred, s_tr)
     sh_b = _sharpe_on_sessions(pred, s_lb)

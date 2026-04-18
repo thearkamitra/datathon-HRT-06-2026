@@ -12,6 +12,7 @@ from datathon_sharpe.path_features import (
     FEATURE_COLUMNS_PATH_SHARPE,
     build_session_features_with_path,
 )
+from datathon_sharpe.ts_cnn import CNN_EXTRA_COLUMNS
 
 EPS = 1e-12
 
@@ -38,7 +39,9 @@ SENTIMENT_EXTRA_COLUMNS: list[str] = [
     "granular_sector_entropy",
 ]
 
-FEATURE_COLUMNS_SHARPE: list[str] = list(FEATURE_COLUMNS_PATH_SHARPE) + SENTIMENT_EXTRA_COLUMNS
+FEATURE_COLUMNS_SHARPE: list[str] = (
+    list(FEATURE_COLUMNS_PATH_SHARPE) + SENTIMENT_EXTRA_COLUMNS + CNN_EXTRA_COLUMNS
+)
 
 
 def load_sentiments_seen_train(data_dir: Path) -> pd.DataFrame | None:
@@ -228,10 +231,13 @@ def build_sharpe_session_features(
     base = build_session_features_with_path(bars, headlines, first_half=first_half)
     last_bar = FIRST_HALF_LAST_BAR_IX if first_half else 49
     bpath = bars.loc[bars["bar_ix"] <= FIRST_HALF_LAST_BAR_IX] if first_half else bars
-    return merge_sharpe_sentiment_features(base, bpath, sentiments, last_bar_ix=last_bar)
+    out = merge_sharpe_sentiment_features(base, bpath, sentiments, last_bar_ix=last_bar)
+    out["cnn_r_pred"] = 0.0
+    return out
 
 
 __all__ = [
+    "CNN_EXTRA_COLUMNS",
     "FEATURE_COLUMNS_SHARPE",
     "FEATURE_COLUMNS_PATH_SHARPE",
     "SENTIMENT_EXTRA_COLUMNS",
