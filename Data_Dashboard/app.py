@@ -14,8 +14,8 @@ import plotly.graph_objects as go
 import streamlit as st
 from plotly.subplots import make_subplots
 
-# Default: sibling folder hrt-eth-zurich-datathon-2026/data
-_DATA_FALLBACK = Path(__file__).resolve().parent.parent / "hrt-eth-zurich-datathon-2026" / "data"
+# Default: repo root data/ (parquet files)
+_DATA_FALLBACK = Path(__file__).resolve().parent.parent / "data"
 
 COMBINED_TRAIN = "Train — combined (seen + unseen)"
 

@@ -9,29 +9,28 @@ Examples:
   cd Submissions && python generate_submission.py
   python generate_submission.py --seed 42
   python generate_submission.py --zeros
-  python generate_submission.py --data-dir ../../hrt-eth-zurich-datathon-2026/data
+  python generate_submission.py --data-dir ../../data
 """
 
 from __future__ import annotations
 
 import argparse
+import sys
 from pathlib import Path
 
 import numpy as np
 import pandas as pd
 
+_REPO = Path(__file__).resolve().parent.parent
+if str(_REPO / "src") not in sys.path:
+    sys.path.insert(0, str(_REPO / "src"))
+
+from datathon_baseline.io import list_test_sessions  # noqa: E402
+from datathon_baseline.paths import data_dir as package_data_dir  # noqa: E402
+
 
 def _default_data_dir() -> Path:
-    # This file lives in .../datathon-HRT-06-2026/Submissions/
-    repo = Path(__file__).resolve().parent.parent
-    return repo.parent / "hrt-eth-zurich-datathon-2026" / "data"
-
-
-def load_test_sessions(data_dir: Path) -> list[int]:
-    pub = pd.read_parquet(data_dir / "bars_seen_public_test.parquet", columns=["session"])
-    priv = pd.read_parquet(data_dir / "bars_seen_private_test.parquet", columns=["session"])
-    ids = sorted(set(pub["session"].unique()) | set(priv["session"].unique()))
-    return [int(x) for x in ids]
+    return package_data_dir()
 
 
 def main() -> None:
@@ -43,7 +42,7 @@ def main() -> None:
         "--data-dir",
         type=Path,
         default=_default_data_dir(),
-        help="Folder with bars_seen_*_test.parquet (default: sibling hrt-eth-zurich-datathon-2026/data).",
+        help="Folder with bars_seen_*_test.parquet (default: repo data/).",
     )
     p.add_argument(
         "-o",
@@ -75,7 +74,7 @@ def main() -> None:
     if not data_dir.is_dir():
         raise SystemExit(f"Data directory not found: {data_dir}")
 
-    sessions = load_test_sessions(data_dir)
+    sessions = list_test_sessions(data_dir)
     n = len(sessions)
     if args.zeros:
         targets = np.zeros(n, dtype=np.float64)
