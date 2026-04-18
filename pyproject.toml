@@ -19,13 +19,14 @@ dependencies = [
     "scipy>=1.10",
     "streamlit>=1.32",
     "plotly>=5.18",
+    "kaleido>=0.2",
 ]
 
 [project.scripts]
 headline-analyzer = "src.main:main"
 
-[tool.uv]
-dev-dependencies = [
+[dependency-groups]
+dev = [
     "pytest",
     "black",
     "isort",

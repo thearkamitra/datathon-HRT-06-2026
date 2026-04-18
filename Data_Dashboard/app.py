@@ -9,6 +9,7 @@ import functools
 import random
 from pathlib import Path
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -17,7 +18,17 @@ from plotly.subplots import make_subplots
 # Default: repo root data/ (parquet files)
 _DATA_FALLBACK = Path(__file__).resolve().parent.parent / "data"
 
+BARS_SEEN_TRAIN = "bars_seen_train.parquet"
+BARS_UNSEEN_TRAIN = "bars_unseen_train.parquet"
+
 COMBINED_TRAIN = "Train — combined (seen + unseen)"
+TRAIN_CHOICES = frozenset(
+    {
+        COMBINED_TRAIN,
+        "Train — bars seen",
+        "Train — bars unseen",
+    }
+)
 
 DATASET_FILES: dict[str, tuple[str, str]] = {
     "Train — bars seen": ("bars_seen_train.parquet", "headlines_seen_train.parquet"),
@@ -162,6 +173,222 @@ def per_session_combined_train(
     per["headline_count"] = per["session"].apply(lambda x: int(hs.get(x, 0)) + int(hu.get(x, 0)))
     per["bars"] = 100
     return per
+
+
+def _segment_ohlc_stats(g: pd.DataFrame, prefix: str) -> dict[str, float]:
+    """Aggregate OHLC stats for one session segment (one contiguous bar_ix range)."""
+    g = g.sort_values("bar_ix")
+    if g.empty:
+        return {}
+    o0 = float(g["open"].iloc[0])
+    c_last = float(g["close"].iloc[-1])
+    close = g["close"].astype(np.float64)
+    rets = close.pct_change().fillna(0.0)
+    hi = float(g["high"].max())
+    lo = float(g["low"].min())
+    return {
+        f"{prefix}open_first": o0,
+        f"{prefix}close_last": c_last,
+        f"{prefix}return": c_last / o0 - 1.0,
+        f"{prefix}vol": float(rets.std(ddof=0)),
+        f"{prefix}range_hl": hi - lo,
+        f"{prefix}mean_bar_ret": float(rets.mean()),
+    }
+
+
+def train_bars_session_table(bars_seen: pd.DataFrame, bars_unseen: pd.DataFrame) -> pd.DataFrame:
+    """
+    One row per training session from `bars_seen_train` + `bars_unseen_train` only.
+
+    **Seen (bar_ix 0–49)** → *features* observable before the single decision at bar 50
+    (`feat_seen_*`).
+
+    **Unseen (bar_ix 50–99)** → *label period*; the main outcome to predict is the return on
+    that segment, **`label_unseen_return`** (last close / first open of the unseen window).
+
+    **R** is the README-style second-half return:
+    $$R = \\mathrm{close}_{99}/\\mathrm{close}_{49} - 1$$ (close-to-close from end of seen to end of session).
+    """
+    rows: list[dict] = []
+    for session in sorted(bars_seen["session"].unique()):
+        bs = bars_seen[bars_seen["session"] == session].sort_values("bar_ix")
+        bu = bars_unseen[bars_unseen["session"] == session].sort_values("bar_ix")
+        if bs.empty or bu.empty:
+            continue
+        c49 = bs.loc[bs["bar_ix"] == 49, "close"]
+        c99 = bu.loc[bu["bar_ix"] == 99, "close"]
+        if len(c49) != 1 or len(c99) != 1:
+            continue
+        close_half = float(c49.iloc[0])
+        close_end = float(c99.iloc[0])
+        row: dict = {"session": int(session)}
+        row.update(_segment_ohlc_stats(bs, "feat_seen_"))
+        row.update(_segment_ohlc_stats(bu, "label_unseen_"))
+        row["ref_close_bar49"] = close_half
+        row["ref_close_bar99"] = close_end
+        row["R"] = close_end / close_half - 1.0
+        o0 = float(bs["open"].iloc[0])
+        row["full_session_return"] = close_end / o0 - 1.0
+        rows.append(row)
+    return pd.DataFrame(rows)
+
+
+def _corr_numeric_columns(df: pd.DataFrame, candidates: list[str]) -> list[str]:
+    """Drop missing / constant columns so correlation is well-defined."""
+    out: list[str] = []
+    for c in candidates:
+        if c not in df.columns:
+            continue
+        s = pd.to_numeric(df[c], errors="coerce")
+        if s.notna().sum() < 2:
+            continue
+        if s.nunique(dropna=True) <= 1:
+            continue
+        out.append(c)
+    return out
+
+
+def train_feature_column_names(all_cols: list[str]) -> list[str]:
+    """Columns derived from the seen window only (observable before bar 50)."""
+    return sorted(c for c in all_cols if c.startswith("feat_seen_"))
+
+
+def train_label_column_names(all_cols: list[str]) -> list[str]:
+    """
+    Label-period and outcome columns: unseen-segment stats, README R, and full-session return.
+    Primary outcome for “what happens after you act” is **label_unseen_return**.
+
+    Raw unseen open/close *prices* are omitted from this block so the heatmap focuses on
+    returns and distributional stats (price levels often correlate mechanically with seen path).
+    """
+    skip_prices = frozenset({"label_unseen_open_first", "label_unseen_close_last"})
+    out: list[str] = []
+    for c in sorted(all_cols):
+        if c.startswith("label_unseen_") and c not in skip_prices:
+            out.append(c)
+    for extra in ("R", "full_session_return"):
+        if extra in all_cols and extra not in out:
+            out.append(extra)
+    return out
+
+
+def feature_vs_label_corr(
+    df: pd.DataFrame,
+    feature_cols: list[str],
+    label_cols: list[str],
+    *,
+    method: str,
+) -> pd.DataFrame:
+    """Pairwise correlation between each feature column and each label column (cross-block only)."""
+    fc = _corr_numeric_columns(df, feature_cols)
+    lc = _corr_numeric_columns(df, label_cols)
+    out = pd.DataFrame(index=fc, columns=lc, dtype=float)
+    for f in fc:
+        for ell in lc:
+            out.loc[f, ell] = df[f].corr(df[ell], method=method)
+    return out
+
+
+def fig_cross_corr_heatmap(cross: pd.DataFrame, *, title: str) -> go.Figure:
+    """Rows = features, columns = labels; values in $$[-1,1]$$."""
+    row_labels = list(cross.index)
+    col_labels = list(cross.columns)
+    z = cross.to_numpy(dtype=float)
+    text = np.round(z, 3).astype(object)
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=col_labels,
+            y=row_labels,
+            colorscale="RdBu",
+            zmid=0.0,
+            zmin=-1.0,
+            zmax=1.0,
+            text=text,
+            texttemplate="%{text}",
+            hovertemplate="feature %{y}<br>label %{x}<br>r = %{z:.4f}<extra></extra>",
+        )
+    )
+    h = 120 + len(row_labels) * 36
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        height=min(h, 720),
+        margin=dict(l=160, r=48, t=56, b=120),
+        xaxis=dict(side="bottom", tickangle=-35),
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def fig_correlation_heatmap(corr: pd.DataFrame, *, title: str) -> go.Figure:
+    labels = list(corr.columns)
+    z = corr.to_numpy(dtype=float)
+    text = np.round(z, 3).astype(object)
+    fig = go.Figure(
+        data=go.Heatmap(
+            z=z,
+            x=labels,
+            y=labels,
+            colorscale="RdBu",
+            zmid=0.0,
+            zmin=-1.0,
+            zmax=1.0,
+            text=text,
+            texttemplate="%{text}",
+            hovertemplate="%{y} vs %{x}<br>r = %{z:.4f}<extra></extra>",
+        )
+    )
+    h = 480 + max(0, len(labels) - 8) * 14
+    fig.update_layout(
+        title=title,
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        height=min(h, 900),
+        margin=dict(l=120, r=48, t=56, b=120),
+        xaxis=dict(side="bottom", tickangle=-40),
+        yaxis=dict(autorange="reversed"),
+    )
+    return fig
+
+
+def fig_correlation_scatter(
+    df: pd.DataFrame,
+    x: str,
+    y: str,
+    *,
+    title: str,
+    method: str = "pearson",
+) -> go.Figure:
+    sub = df[[x, y]].dropna()
+    fig = go.Figure(
+        data=go.Scatter(
+            x=sub[x],
+            y=sub[y],
+            mode="markers",
+            marker=dict(size=6, color="#90caf9", opacity=0.65),
+            name="sessions",
+        )
+    )
+    if len(sub) >= 2:
+        r = sub[x].corr(sub[y], method=method)
+        label = "ρ" if method == "spearman" else "r"
+        fig.update_layout(title=f"{title} ({label} = {r:.3f})")
+    else:
+        fig.update_layout(title=title)
+    fig.update_layout(
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        height=400,
+        xaxis_title=x,
+        yaxis_title=y,
+        margin=dict(l=48, r=24, t=48, b=48),
+    )
+    return fig
 
 
 def fig_candlestick_with_news(
@@ -367,7 +594,7 @@ def main() -> None:
             else:
                 fig = fig_candlestick_with_news(b_s, h_s, sid)
 
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, use_container_width=True, key=f"session_candle_{choice}_{sid}")
 
             st.subheader("Headlines for this session")
             if h_s.empty:
@@ -449,7 +676,7 @@ def main() -> None:
                 height=360,
                 margin=dict(l=48, r=24, t=48, b=48),
             )
-            st.plotly_chart(fig_r, use_container_width=True)
+            st.plotly_chart(fig_r, use_container_width=True, key=f"overview_hist_return_{choice}")
 
         with c2:
             fig_h = go.Figure()
@@ -473,7 +700,119 @@ def main() -> None:
                 height=360,
                 margin=dict(l=48, r=24, t=48, b=48),
             )
-            st.plotly_chart(fig_h, use_container_width=True)
+            st.plotly_chart(fig_h, use_container_width=True, key=f"overview_hist_headlines_{choice}")
+
+        if choice in TRAIN_CHOICES:
+            st.subheader("Train: features (seen) vs labels (unseen)")
+            st.caption(
+                "You only choose an action once, at **bar 50**. Everything in **`bars_seen_train`** "
+                "(bar_ix 0–49) is *known before* that choice — treat these as **features** (`feat_seen_*`). "
+                "The **unseen** path (**`bars_unseen_train`**, bar_ix 50–99) is what you do *not* know at decision time; "
+                "its total return **`label_unseen_return`** (last close / first open on that segment) is the main **label** "
+                "to relate to features. **R** is $$\\mathrm{close}_{99}/\\mathrm{close}_{49}-1$$ (README second-half return)."
+            )
+            with st.spinner("Aggregating train bars…"):
+                bs_tr = load_bars(str(data_path), BARS_SEEN_TRAIN)
+                bu_tr = load_bars(str(data_path), BARS_UNSEEN_TRAIN)
+                merged = train_bars_session_table(bs_tr, bu_tr)
+            cand = [c for c in merged.columns if c != "session"]
+            use_cols = _corr_numeric_columns(merged, cand)
+            feat_names = train_feature_column_names(use_cols)
+            label_names = train_label_column_names(use_cols)
+            if len(use_cols) < 2:
+                st.warning("Not enough varying numeric columns to compute correlations.")
+            else:
+                cm1, cm2 = st.columns([1, 2])
+                with cm1:
+                    corr_method = st.radio(
+                        "Correlation",
+                        ("Pearson", "Spearman"),
+                        horizontal=False,
+                        key=f"corr_method_{choice}",
+                        help="Pearson: linear. Spearman: monotonic (rank-based), more robust to outliers.",
+                    )
+                method = "pearson" if corr_method == "Pearson" else "spearman"
+                with cm2:
+                    dropped = set(cand) - set(use_cols)
+                    st.caption(
+                        f"**{len(merged)}** sessions · dropped (constant): {dropped or 'none'}"
+                    )
+
+                if "feat_seen_return" in merged.columns and "label_unseen_return" in merged.columns:
+                    st.markdown("**Primary view — seen return vs unseen return (label)**")
+                    fig_main = fig_correlation_scatter(
+                        merged,
+                        "feat_seen_return",
+                        "label_unseen_return",
+                        title="label_unseen_return vs feat_seen_return",
+                        method=method,
+                    )
+                    st.plotly_chart(
+                        fig_main,
+                        use_container_width=True,
+                        key=f"train_scatter_feat_vs_label_{choice}",
+                    )
+                else:
+                    st.info("Missing `feat_seen_return` or `label_unseen_return`; check train parquet layout.")
+
+                if feat_names and label_names:
+                    cross = feature_vs_label_corr(
+                        merged, feat_names, label_names, method=method
+                    )
+                    if not cross.empty and cross.shape[0] > 0 and cross.shape[1] > 0:
+                        st.markdown(
+                            f"**Feature × label correlations** ({corr_method}) — rows = seen features, columns = unseen / outcomes"
+                        )
+                        fig_cross = fig_cross_corr_heatmap(
+                            cross,
+                            title=f"{corr_method}: feat(seen) vs label(unseen + R)",
+                        )
+                        st.plotly_chart(
+                            fig_cross,
+                            use_container_width=True,
+                            key=f"train_cross_corr_heatmap_{choice}",
+                        )
+
+                st.markdown("**Full numeric correlation matrix** (all columns)")
+                sub = merged[use_cols]
+                corr_mat = sub.corr(method=method, numeric_only=True)
+                title = f"{corr_method} · all train bar stats"
+                fig_corr = fig_correlation_heatmap(corr_mat, title=title)
+                st.plotly_chart(
+                    fig_corr,
+                    use_container_width=True,
+                    key=f"train_full_corr_matrix_{choice}",
+                )
+
+                st.markdown("**Inspect any pair**")
+                ax1, ax2 = st.columns(2)
+                default_x = "feat_seen_return" if "feat_seen_return" in use_cols else use_cols[0]
+                default_y = "label_unseen_return" if "label_unseen_return" in use_cols else use_cols[-1]
+                with ax1:
+                    cx = st.selectbox(
+                        "X",
+                        use_cols,
+                        index=use_cols.index(default_x) if default_x in use_cols else 0,
+                        key=f"cx_{choice}",
+                    )
+                with ax2:
+                    cy = st.selectbox(
+                        "Y",
+                        use_cols,
+                        index=use_cols.index(default_y) if default_y in use_cols else min(1, len(use_cols) - 1),
+                        key=f"cy_{choice}",
+                    )
+                fig_sc = fig_correlation_scatter(
+                    merged, cx, cy, title=f"{cy} vs {cx}", method=method
+                )
+                st.plotly_chart(
+                    fig_sc,
+                    use_container_width=True,
+                    key=f"train_scatter_pair_{choice}_{cx}_{cy}",
+                )
+
+                with st.expander("Correlation matrix (CSV-style)"):
+                    st.dataframe(corr_mat, use_container_width=True)
 
         st.caption(
             "Prices start near 1. For 50-bar views, the dashed line is the competition halfway decision bar. "
