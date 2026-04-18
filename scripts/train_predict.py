@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Train baseline (ridge / momentum / constant) and write submission CSV."""
+"""Train baseline (Sharpe-linear / ridge / momentum / constant) and write submission CSV."""
 
 from __future__ import annotations
 
@@ -28,15 +28,20 @@ def main() -> None:
         "--method",
         type=str,
         choices=[m.value for m in Method],
-        default=Method.ridge.value,
+        default=Method.sharpe_linear.value,
     )
     p.add_argument(
         "--ridge-alpha",
         type=float,
         default=1.0,
-        help="Ridge alpha (sklearn). Ignored unless --method ridge.",
+        help="Ridge alpha (sklearn). Only for --method ridge.",
     )
-    p.add_argument("--seed", type=int, default=0, help="Random seed for Ridge.")
+    p.add_argument(
+        "--seed",
+        type=int,
+        default=0,
+        help="Random seed (Ridge, Sharpe-linear init if needed).",
+    )
     p.add_argument(
         "-o",
         "--output",
@@ -58,9 +63,11 @@ def main() -> None:
     sub.to_csv(args.output, index=False)
 
     print(f"Method: {res.method.value}")
-    print(f"Train Sharpe (aligned sign): {res.train_sharpe:.6f}")
+    print(f"Train Sharpe: {res.train_sharpe:.6f}")
     if res.ridge_alpha is not None:
         print(f"Ridge alpha: {res.ridge_alpha}")
+    if res.sharpe_opt_message:
+        print(f"Sharpe optimizer: {res.sharpe_opt_message}")
     print(f"Wrote {len(sub)} rows to {args.output.resolve()}")
 
 
