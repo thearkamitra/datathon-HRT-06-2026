@@ -11,6 +11,8 @@ dependencies = [
     "numpy",
     "python-dotenv",
     "requests",
+    "tqdm",
+    "scikit-learn>=1.6.1",
 ]
 
 [project.scripts]

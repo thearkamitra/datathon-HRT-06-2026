@@ -13,6 +13,7 @@ def main():
     parser.add_argument("--limit", type=int, help="Headlines per session limit (default: all headlines in session)")
     parser.add_argument("--input", type=str, default="data/headlines_seen_train.parquet", help="Input parquet file")
     parser.add_argument("--company", type=str, help="Specific company to report on (default: all identified companies)")
+    parser.add_argument("--workers", type=int, default=5, help="Number of concurrent workers (default: 5)")
     
     args = parser.parse_args()
     
@@ -27,6 +28,7 @@ def main():
             provider=args.provider,
             session_limit=args.sessions,
             headline_limit=args.limit,
+            max_workers=args.workers,
             **predictor_kwargs
         )
         
@@ -36,7 +38,9 @@ def main():
         if not report.empty:
             # Displaying grouped results
             for company, group in report.groupby("company"):
+                sessions = group.iloc[0]["associated_sessions"]
                 print(f"\nCompany: {company}")
+                print(f"Associated Sessions: {sessions}")
                 print("-" * (9 + len(company)))
                 for _, row in group.iterrows():
                     move = "▲ BUY" if row['sentiment'] == 'buy' else "▼ SELL"

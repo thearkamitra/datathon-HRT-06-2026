@@ -22,9 +22,9 @@ class Headline:
         """
         context_str = ""
         if history:
-            context_str = "Previous headlines for this company:\n"
+            context_str = "Historical headlines for this company:\n"
             for h in history:
-                context_str += f"- Bar {h.bar_ix}: {h.text} (Sentiment: {h.sentiment}, Confidence: {h.confidence})\n"
+                context_str += f"- Session {h.session}, Bar {h.bar_ix}: {h.text} (Sentiment: {h.sentiment}, Confidence: {h.confidence})\n"
         
         prompt = f"""
         Analyze the following financial headline for a synthetic stock market challenge.
@@ -95,13 +95,26 @@ class HeadlineCollection:
     def get_session_headlines(self, session: int) -> List[Headline]:
         return self.sessions.get(session, [])
 
-    def get_company_history(self, company: str, session: int, current_bar: int) -> List[Headline]:
-        """Returns headlines for a company in a session that occurred before current_bar."""
+    def get_company_history(self, company: str, session: int, current_bar: int, global_history: bool = True) -> List[Headline]:
+        """
+        Returns headlines for a company that occurred before the current point.
+        If global_history is True, it looks across all sessions. 
+        If False, it only looks within the current session.
+        """
         if company not in self.companies:
             return []
         
-        history = [
-            h for h in self.companies[company] 
-            if h.session == session and h.bar_ix < current_bar
-        ]
-        return sorted(history, key=lambda x: x.bar_ix)
+        if global_history:
+            # All headlines from earlier sessions OR same session but earlier bar
+            history = [
+                h for h in self.companies[company] 
+                if h.session < session or (h.session == session and h.bar_ix < current_bar)
+            ]
+        else:
+            # Only same session, earlier bar
+            history = [
+                h for h in self.companies[company] 
+                if h.session == session and h.bar_ix < current_bar
+            ]
+            
+        return sorted(history, key=lambda x: (x.session, x.bar_ix))
