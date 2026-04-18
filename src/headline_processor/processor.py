@@ -32,6 +32,8 @@ class Processor:
             if key in lookup:
                 h = lookup[key]
                 h.company = row.get('company')
+                h.granular_sector = row.get('granular_sector')
+                h.sector = row.get('sector')
                 h.sentiment = row.get('sentiment')
                 h.sentiment_score = row.get('sentiment_score')
                 h.confidence = row.get('confidence')
@@ -40,6 +42,36 @@ class Processor:
                 # Also ensure it's indexed in the companies dict
                 if h.company:
                     self.collection._index_by_company(h)
+
+    def map_granular_sectors(self, predictor):
+        """
+        Collects all unique granular sectors and maps them to broad sectors using the LLM.
+        """
+        unique_granular = set()
+        for h in self.collection.headlines:
+            if h.granular_sector:
+                unique_granular.add(h.granular_sector)
+        
+        if not unique_granular:
+            return
+
+        prompt = f"""
+        Map the following granular industrial sectors to broad categories 
+        (e.g., Technology, Healthcare, Energy, Finance, Consumer Goods, Industrials, etc.).
+        
+        Sectors: {", ".join(sorted(list(unique_granular)))}
+        
+        Respond with a JSON object where keys are granular sectors and values are broad categories.
+        Example: {{"Biosciences": "Healthcare", "Renewables": "Energy"}}
+        """
+        
+        try:
+            mapping = predictor.predict_json(prompt)
+            for h in self.collection.headlines:
+                if h.granular_sector in mapping:
+                    h.sector = mapping[h.granular_sector]
+        except Exception as e:
+            print(f"Error mapping sectors: {e}")
 
     def _process_single_session(self, session_id: int, headline_limit: Optional[int] = None, batch_size: int = 5):
         headlines = sorted(self.collection.get_session_headlines(session_id), key=lambda x: x.bar_ix)
@@ -113,6 +145,8 @@ class Processor:
                     "bar_ix": h.bar_ix,
                     "headline": h.text,
                     "company": h.company,
+                    "granular_sector": h.granular_sector,
+                    "sector": h.sector,
                     "sentiment": h.sentiment,
                     "sentiment_score": h.sentiment_score,
                     "confidence": h.confidence,
@@ -139,6 +173,8 @@ class Processor:
             for h in sorted_h:
                 data.append({
                     "company": co,
+                    "granular_sector": h.granular_sector,
+                    "sector": h.sector,
                     "associated_sessions": associated_sessions,
                     "session": h.session,
                     "bar_ix": h.bar_ix,
