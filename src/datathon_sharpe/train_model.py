@@ -17,7 +17,11 @@ from datathon_baseline.io import (
 )
 from datathon_baseline.metrics import sharpe
 from datathon_baseline.predict import Method, TrainResult, _fit_linear_sharpe
-from datathon_sharpe.path_features import FEATURE_COLUMNS_SHARPE, build_session_features_with_path
+from datathon_sharpe.sentiment_features import (
+    FEATURE_COLUMNS_SHARPE,
+    build_sharpe_session_features,
+    load_sentiments_seen_test,
+)
 from datathon_sharpe.training_table import load_training_feature_matrices
 
 
@@ -63,6 +67,8 @@ def fit_full_train_and_submission(
         headlines_te = pd.concat([h_pub, h_priv], ignore_index=True)
     except Exception:
         headlines_te = None
+
+    sen_te = load_sentiments_seen_test(data_dir)
 
     R_fit = feat_fit["R"].to_numpy(dtype=np.float64)
     X_fit = feat_fit[FEATURE_COLUMNS_SHARPE].to_numpy(dtype=np.float64)
@@ -137,9 +143,10 @@ def fit_full_train_and_submission(
         }
     )
 
-    feat_te_pred = build_session_features_with_path(
+    feat_te_pred = build_sharpe_session_features(
         bars_te,
         headlines_te,
+        sen_te,
         first_half=within_session_split,
     )
     X_test = feat_te_pred[FEATURE_COLUMNS_SHARPE].to_numpy(dtype=np.float64)
