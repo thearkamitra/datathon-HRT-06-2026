@@ -24,6 +24,10 @@ dependencies = [
 
 [project.scripts]
 headline-analyzer = "src.main:main"
+train-predict-headlines = "datathon_headline_pipeline.cli:main"
+generate-headline-submissions = "datathon_headline_pipeline.all_submissions:main"
+train-competition = "datathon_competition.cli:main"
+train-sharpe-cv = "datathon_sharpe.cli:main"
 
 [dependency-groups]
 dev = [
@@ -37,5 +41,4 @@ requires = ["setuptools>=61.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
-where = ["."]
-include = ["src*"]
+where = ["src"]

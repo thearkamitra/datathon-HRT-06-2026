@@ -33,8 +33,14 @@ def main() -> None:
     p.add_argument(
         "--ridge-alpha",
         type=float,
-        default=1.0,
-        help="Ridge alpha (sklearn). Only for --method ridge.",
+        default=5.0,
+        help="Ridge / ElasticNet alpha: --method ridge; Sharpe-linear warm-start.",
+    )
+    p.add_argument(
+        "--l1-ratio",
+        type=float,
+        default=0.15,
+        help="Sharpe-linear warm-start: ElasticNet l1_ratio (0=Ridge-only). Ignored for ridge.",
     )
     p.add_argument(
         "--seed",
@@ -55,9 +61,17 @@ def main() -> None:
     dd = dd.resolve()
     if not dd.is_dir():
         raise SystemExit(f"Data directory not found: {dd}")
+    if not 0.0 <= args.l1_ratio <= 1.0:
+        raise SystemExit("--l1-ratio must be between 0 and 1.")
 
     method = Method(args.method)
-    sub, res = fit_and_predict(dd, method, ridge_reg=args.ridge_alpha, random_state=args.seed)
+    sub, res = fit_and_predict(
+        dd,
+        method,
+        ridge_reg=args.ridge_alpha,
+        random_state=args.seed,
+        l1_ratio=args.l1_ratio,
+    )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
     sub.to_csv(args.output, index=False)
@@ -66,6 +80,8 @@ def main() -> None:
     print(f"Train Sharpe: {res.train_sharpe:.6f}")
     if res.ridge_alpha is not None:
         print(f"Ridge alpha: {res.ridge_alpha}")
+    if res.l1_ratio is not None:
+        print(f"L1 ratio (warm-start): {res.l1_ratio}")
     if res.sharpe_opt_message:
         print(f"Sharpe optimizer: {res.sharpe_opt_message}")
     print(f"Wrote {len(sub)} rows to {args.output.resolve()}")
