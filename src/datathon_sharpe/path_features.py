@@ -30,7 +30,8 @@ PATH_EXTRA_COLUMNS: list[str] = [
     "ret_skew",
 ]
 
-FEATURE_COLUMNS_SHARPE: list[str] = BASELINE_COLUMNS_SHARPE + PATH_EXTRA_COLUMNS
+# Path-only Sharpe columns (baseline subset + path extras). Full training list adds sentiment in ``sentiment_features``.
+FEATURE_COLUMNS_PATH_SHARPE: list[str] = BASELINE_COLUMNS_SHARPE + PATH_EXTRA_COLUMNS
 
 
 def compute_extended_path_features(
@@ -166,7 +167,7 @@ def build_session_features_with_path(
 __all__ = [
     "BASELINE_COLUMNS_SHARPE",
     "EPS",
-    "FEATURE_COLUMNS_SHARPE",
+    "FEATURE_COLUMNS_PATH_SHARPE",
     "PATH_EXTRA_COLUMNS",
     "build_session_features_with_path",
     "compute_extended_path_features",

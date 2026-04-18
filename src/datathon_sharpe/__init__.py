@@ -7,9 +7,13 @@ from datathon_sharpe.features_seen_split import (
 )
 from datathon_sharpe.path_features import (
     BASELINE_COLUMNS_SHARPE,
-    FEATURE_COLUMNS_SHARPE,
+    FEATURE_COLUMNS_PATH_SHARPE,
     PATH_EXTRA_COLUMNS,
     build_session_features_with_path,
+)
+from datathon_sharpe.sentiment_features import (
+    FEATURE_COLUMNS_SHARPE,
+    build_sharpe_session_features,
 )
 from datathon_sharpe.labels_seen_split import (
     proxy_returns_second_seen_half_from_bars,
@@ -27,7 +31,9 @@ from datathon_sharpe.train_model import fit_full_train_and_submission, fit_full_
 __all__ = [
     "BASELINE_COLUMNS_SHARPE",
     "CVReport",
+    "FEATURE_COLUMNS_PATH_SHARPE",
     "FEATURE_COLUMNS_SHARPE",
+    "build_sharpe_session_features",
     "FIRST_HALF_LAST_BAR_IX",
     "PATH_EXTRA_COLUMNS",
     "build_session_features_first_half",

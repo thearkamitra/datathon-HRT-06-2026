@@ -13,7 +13,11 @@ from datathon_baseline.io import (
     read_bars,
 )
 from datathon_baseline.labels import train_realized_returns
-from datathon_sharpe.path_features import build_session_features_with_path
+from datathon_sharpe.sentiment_features import (
+    build_sharpe_session_features,
+    load_sentiments_seen_test,
+    load_sentiments_seen_train,
+)
 from datathon_sharpe.labels_seen_split import (
     proxy_returns_second_seen_half_from_bars,
     train_proxy_returns_second_seen_half,
@@ -52,15 +56,18 @@ def load_training_feature_matrices(
     except Exception:
         headlines_te = None
 
+    sen_tr = load_sentiments_seen_train(data_dir)
+    sen_te = load_sentiments_seen_test(data_dir)
+
     if augment_test_with_proxy:
         labels_main = train_realized_returns(data_dir)
-        feat_main = build_session_features_with_path(bars_tr, headlines_tr, first_half=False)
+        feat_main = build_sharpe_session_features(bars_tr, headlines_tr, sen_tr, first_half=False)
         feat_main = feat_main.merge(labels_main[["session", "R"]], on="session", how="inner")
         if len(feat_main) != len(labels_main):
             raise RuntimeError("Feature / label session alignment failed (train).")
 
         labels_aug = proxy_returns_second_seen_half_from_bars(bars_te)
-        feat_aug = build_session_features_with_path(bars_te, headlines_te, first_half=True)
+        feat_aug = build_sharpe_session_features(bars_te, headlines_te, sen_te, first_half=True)
         feat_aug = feat_aug.merge(labels_aug[["session", "R"]], on="session", how="inner")
         if len(feat_aug) != len(labels_aug):
             raise RuntimeError("Feature / label session alignment failed (test augment).")
@@ -68,7 +75,7 @@ def load_training_feature_matrices(
         feat_fit = pd.concat([feat_main, feat_aug], ignore_index=True)
     elif within_session_split:
         labels = train_proxy_returns_second_seen_half(data_dir)
-        feat_tr = build_session_features_with_path(bars_tr, headlines_tr, first_half=True)
+        feat_tr = build_sharpe_session_features(bars_tr, headlines_tr, sen_tr, first_half=True)
         feat_tr = feat_tr.merge(labels[["session", "R"]], on="session", how="inner")
         if len(feat_tr) != len(labels):
             raise RuntimeError("Feature / label session alignment failed.")
@@ -76,7 +83,7 @@ def load_training_feature_matrices(
         feat_fit = feat_tr
     else:
         labels = train_realized_returns(data_dir)
-        feat_tr = build_session_features_with_path(bars_tr, headlines_tr, first_half=False)
+        feat_tr = build_sharpe_session_features(bars_tr, headlines_tr, sen_tr, first_half=False)
         feat_tr = feat_tr.merge(labels[["session", "R"]], on="session", how="inner")
         if len(feat_tr) != len(labels):
             raise RuntimeError("Feature / label session alignment failed.")
