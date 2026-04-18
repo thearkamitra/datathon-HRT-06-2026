@@ -8,6 +8,8 @@ class Headline:
     bar_ix: int
     text: str
     company: Optional[str] = None
+    granular_sector: Optional[str] = None
+    sector: Optional[str] = None
     sentiment: Optional[str] = None  # "buy" or "sell"
     sentiment_score: Optional[float] = None # -1.0 to 1.0
     confidence: Optional[float] = None # 0.0 to 1.0
@@ -15,7 +17,7 @@ class Headline:
     history_context: List[str] = field(default_factory=list)
     
     def __repr__(self):
-        return f"Headline(session={self.session}, bar_ix={self.bar_ix}, company={self.company}, sentiment={self.sentiment}, score={self.sentiment_score})"
+        return f"Headline(session={self.session}, bar_ix={self.bar_ix}, company={self.company}, sector={self.sector}, score={self.sentiment_score})"
 
     @staticmethod
     def predict_batch(predictor, headlines: List['Headline'], history_map: Dict[str, List['Headline']] = None):
@@ -25,11 +27,18 @@ class Headline:
         if not headlines:
             return
 
-        # Simple company extraction: first word or first two words (check for ' Biosciences', etc)
-        # For this specific dataset, we assume first word is enough as per user instruction.
+        # Simple company and granular sector extraction
         for h in headlines:
-            if h.company is None:
-                h.company = h.text.split()[0]
+            words = h.text.split()
+            if h.company is None and len(words) > 0:
+                h.company = words[0]
+            if len(words) > 1:
+                # If 3rd word exists, is capitalized, and is NOT a common action/title, it's part of the sector
+                excluded = {"Chief", "CEO", "CFO", "CTO", "COO", "names", "reports", "secures", "sees", "faces", "opens", "Chairman", "Founder", "President", "Officer"}
+                if len(words) > 2 and words[2][0].isupper() and words[2] not in excluded:
+                    h.granular_sector = " ".join(words[1:3])
+                else:
+                    h.granular_sector = words[1]
 
         # Check if predictor is FinBERT for optimized local batching
         from src.predictor.predictor import FinBertPredictor

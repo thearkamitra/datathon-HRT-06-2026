@@ -46,11 +46,23 @@ def main():
         results_df
     ], axis=1)
 
-    # Use first word for company name
+    # Use first word for company name, second word (or second and third) for granular sector
     final_df['company'] = final_df['headline'].apply(lambda x: x.split()[0] if x else "None")
+    
+    def extract_granular(x):
+        if not x: return "None"
+        words = x.split()
+        if len(words) < 2: return "None"
+        excluded = {"Chief", "CEO", "CFO", "CTO", "names", "reports", "secures", "sees", "faces", "opens"}
+        if len(words) > 2 and words[2][0].isupper() and words[2] not in excluded:
+            return " ".join(words[1:3])
+        return words[1]
+    
+    final_df['granular_sector'] = final_df['headline'].apply(extract_granular)
+    final_df['sector'] = None # Will be mapped later
 
     # Reorder columns
-    cols = ['session', 'bar_ix', 'headline', 'company', 'sentiment', 'sentiment_score', 'confidence']
+    cols = ['session', 'bar_ix', 'headline', 'company', 'granular_sector', 'sector', 'sentiment', 'sentiment_score', 'confidence']
     final_df = final_df[cols]
 
     print(f"Saving {len(final_df)} results to {args.output}...")
