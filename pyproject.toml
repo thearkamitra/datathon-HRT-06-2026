@@ -20,6 +20,8 @@ dependencies = [
     "streamlit>=1.32",
     "plotly>=5.18",
     "kaleido>=0.2",
+    "xgboost>=2.0",
+    "lightgbm>=4.0",
 ]
 
 [project.scripts]

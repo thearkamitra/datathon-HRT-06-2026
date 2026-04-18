@@ -1,0 +1,148 @@
+#!/usr/bin/env python3
+"""Tailored-modeler predictor CLI (Phase-1 Method 2).
+
+Runs the three-head LightGBM pipeline end-to-end:
+
+* M1 mean-return booster (Huber),
+* M2 sign classifier (``P(R > 0)``),
+* M3 quantile triplet (q10 / q50 / q90) with uncertainty ``u = q90 - q10``,
+
+grid-tunes the Sharpe-aware sizing layer (``target = c * tanh(lambda * z) *
+1{|z|>theta}``) on repeated-KFold OOF predictions, retrains on the full train,
+predicts for the public + private test sessions, and writes a timestamped
+submission file in ``Submissions/`` matching the competition format.
+
+Usage::
+
+    python scripts/tailored-predictor
+    python scripts/tailored-predictor --cv-repeats 3
+    python scripts/tailored-predictor --no-sample-weights --no-adversarial
+    python scripts/tailored-predictor --use-news   # currently raises; see news.py
+
+The news-aware path is intentionally inert: flipping ``--use-news`` raises a
+``NotImplementedError`` in ``news.build_news_features`` so we never silently
+drop the headline signal.
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TM_DIR = _REPO_ROOT / "src" / "tailored-modeler"
+for _p in (_TM_DIR,):
+    sp = str(_p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+from models import BoosterHyper, SampleWeightConfig  # noqa: E402
+from news import NewsConfig  # noqa: E402
+from paths import data_dir as default_data_dir, submissions_dir as default_sub_dir  # noqa: E402
+from pipeline import TailoredConfig, run_pipeline  # noqa: E402
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Tailored-modeler predictor (Phase-1 Method 2: 3-head LightGBM + Sharpe sizer)."
+    )
+    p.add_argument("--data-dir", type=Path, default=None, help="Parquet folder (default: repo data/).")
+    p.add_argument(
+        "--submissions-dir",
+        type=Path,
+        default=None,
+        help="Output folder for the timestamped submission (default: repo Submissions/).",
+    )
+    p.add_argument("--seed", type=int, default=0, help="Random seed for boosters and CV.")
+    p.add_argument("--cv-splits", type=int, default=5, help="K in repeated-KFold.")
+    p.add_argument("--cv-repeats", type=int, default=2, help="Number of CV repeats.")
+    p.add_argument(
+        "--target-scale",
+        type=float,
+        default=1.0,
+        help="Scale of the tanh output (c); Sharpe is scale-invariant but this sets submission magnitude.",
+    )
+    p.add_argument(
+        "--clip-quantile",
+        type=float,
+        default=0.999,
+        help="Safety clip on |target_position| (set 1.0 to disable).",
+    )
+    p.add_argument("--no-sample-weights", action="store_true", help="Disable clipped economic weights.")
+    p.add_argument("--no-adversarial", action="store_true", help="Skip adversarial-validation guardrail.")
+    p.add_argument(
+        "--use-news",
+        action="store_true",
+        help="Enable news-aware branch (currently raises NotImplementedError by design).",
+    )
+    p.add_argument(
+        "--ranking-out",
+        type=Path,
+        default=None,
+        help="Optional path to dump the full per-session ranking frame.",
+    )
+    p.add_argument(
+        "--importances-out",
+        type=Path,
+        default=None,
+        help="Optional path to dump mean-head feature importances.",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    data_dir = (args.data_dir or default_data_dir()).resolve()
+    if not data_dir.is_dir():
+        raise SystemExit(f"Data directory not found: {data_dir}")
+
+    submissions_dir = (args.submissions_dir or default_sub_dir()).resolve()
+    submissions_dir.mkdir(parents=True, exist_ok=True)
+
+    sample_weights = SampleWeightConfig(enabled=not args.no_sample_weights)
+    hyper = BoosterHyper()
+
+    config = TailoredConfig(
+        random_state=args.seed,
+        cv_splits=args.cv_splits,
+        cv_repeats=args.cv_repeats,
+        hyper=hyper,
+        sample_weights=sample_weights,
+        news=NewsConfig(enabled=args.use_news),
+        target_scale=args.target_scale,
+        clip_quantile=args.clip_quantile,
+        run_adversarial=not args.no_adversarial,
+    )
+
+    result = run_pipeline(data_dir, config)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = submissions_dir / f"tailored_submission_{timestamp}.csv"
+    result.submission.to_csv(out_path, index=False)
+
+    print(f"Wrote {len(result.submission)} rows to {out_path}")
+    diag = dict(result.train_diagnostics)
+    diag["tuned_sizing"] = dataclasses.asdict(result.tuned_sizing)
+    print("Train diagnostics:")
+    print(json.dumps(diag, indent=2, default=float))
+
+    if args.ranking_out is not None:
+        rp = Path(args.ranking_out)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        result.rankings.to_csv(rp, index=False)
+        print(f"Ranking dumped to {rp.resolve()}")
+
+    if args.importances_out is not None and result.feature_importances is not None:
+        ip = Path(args.importances_out)
+        ip.parent.mkdir(parents=True, exist_ok=True)
+        result.feature_importances.to_csv(ip, index=False)
+        print(f"Feature importances dumped to {ip.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
