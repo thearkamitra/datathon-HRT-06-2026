@@ -73,8 +73,11 @@ dmypy.json
 # Jupyter
 .ipynb_checkpoints/
 
-# pyenv
-.python-version
+# Optional: uncomment to avoid committing local Python pin
+# .python-version
+
+# uv lockfile (regenerate with `uv lock`)
+uv.lock
 
 # Competition output (regenerate with scripts/train_predict.py or Submissions/generate_submission.py)
 Submissions/submission.csv

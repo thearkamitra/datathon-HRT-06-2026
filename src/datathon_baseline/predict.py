@@ -89,7 +89,14 @@ def fit_and_predict(
     """
     labels = train_realized_returns(data_dir)
     bars_tr = read_bars(data_dir, BARS_SEEN_TRAIN)
-    feat_tr = build_session_features(bars_tr)
+
+    # Load train headlines
+    try:
+        headlines_tr = pd.read_parquet(data_dir / "headlines_seen_train.parquet")
+    except Exception:
+        headlines_tr = None
+
+    feat_tr = build_session_features(bars_tr, headlines_tr)
     feat_tr = feat_tr.merge(labels[["session", "R"]], on="session", how="inner")
 
     if len(feat_tr) != len(labels):
@@ -142,7 +149,14 @@ def fit_and_predict(
     bars_pub = read_bars(data_dir, BARS_SEEN_PUBLIC_TEST)
     bars_priv = read_bars(data_dir, BARS_SEEN_PRIVATE_TEST)
     bars_te = pd.concat([bars_pub, bars_priv], ignore_index=True)
-    feat_te = build_session_features(bars_te)
+    try:
+        h_pub = pd.read_parquet(data_dir / "headlines_seen_public_test.parquet")
+        h_priv = pd.read_parquet(data_dir / "headlines_seen_private_test.parquet")
+        headlines_te = pd.concat([h_pub, h_priv], ignore_index=True)
+    except Exception:
+        headlines_te = None
+
+    feat_te = build_session_features(bars_te, headlines_te)
     X_test = feat_te[FEATURE_COLUMNS].to_numpy(dtype=np.float64)
 
     if method == Method.constant:
