@@ -58,7 +58,16 @@ def _parse_args() -> argparse.Namespace:
         default=None,
         help="Output folder for the timestamped submission (default: repo Submissions/).",
     )
-    p.add_argument("--method", choices=("m1", "m2"), default="m1", help="m1 = pooled HMM, m2 = clustered HMMs.")
+    p.add_argument(
+        "--method",
+        choices=("m1", "m1-linear", "m2"),
+        default="m1",
+        help=(
+            "m1 = pooled HMM + MC continuation; "
+            "m1-linear = pooled HMM + ridge/logistic/quantile head on posterior features; "
+            "m2 = clustered HMMs + mixture forecast."
+        ),
+    )
     p.add_argument("--seed", type=int, default=0, help="Random seed for HMM EM, CV and MC.")
 
     # HMM hyperparameters
@@ -84,9 +93,15 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--bic-tol", type=float, default=50.0, help="BIC tolerance for Level-1 eligibility.")
 
     # Clustering (m2)
-    p.add_argument("--n-clusters", type=int, default=2, help="Cluster count for m2.")
+    p.add_argument("--n-clusters", type=int, default=2, help="Cluster count for m2 (1 falls back to pooled HMM).")
     p.add_argument("--cluster-max-iter", type=int, default=5, help="Reassign/refit rounds for m2.")
     p.add_argument("--cluster-temperature", type=float, default=1.0, help="Softmax temperature for responsibilities.")
+    p.add_argument(
+        "--cluster-min-size",
+        type=int,
+        default=100,
+        help="Refuse reassignments that would drop any cluster below this size (collapse guard).",
+    )
 
     # MC forecasting
     p.add_argument("--horizon", type=int, default=50, help="Forecast horizon in bars (default 50).")
@@ -98,8 +113,46 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--target-scale", type=float, default=1.0, help="Scale of the tanh output (Sharpe is scale-invariant).")
     p.add_argument("--clip-quantile", type=float, default=0.999, help="Clip |target_position| at this quantile (1.0 disables).")
 
-    # News
-    p.add_argument("--use-news", action="store_true", help="Enable news-aware branch (currently raises NotImplementedError).")
+    # News (m1-linear only)
+    p.add_argument(
+        "--use-news",
+        action="store_true",
+        help=(
+            "Enable the first-half news feature block (m1-linear only). "
+            "Features: decay-weighted sentiment aggregates, temporal profile, "
+            "entity concentration, top-K entity footprint, and a TF-IDF+SVD "
+            "topic fingerprint. All fit on train only; transformed on test."
+        ),
+    )
+    p.add_argument(
+        "--news-svd-components",
+        type=int,
+        default=16,
+        help="TruncatedSVD rank for the headline topic fingerprint (0 disables).",
+    )
+    p.add_argument(
+        "--news-top-entities",
+        type=int,
+        default=10,
+        help="Number of most-frequent train companies tracked as dedicated footprint features.",
+    )
+    p.add_argument(
+        "--news-half-life",
+        type=float,
+        default=10.0,
+        help="Decay half-life (in bars) for time-to-decision news weighting.",
+    )
+    p.add_argument(
+        "--news-decision-bar",
+        type=int,
+        default=49,
+        help="Last seen-half bar (inclusive) used for news filtering. 49 for this competition.",
+    )
+    p.add_argument(
+        "--no-news-summary",
+        action="store_true",
+        help="Disable the OHLC session-summary feature block merged alongside news.",
+    )
 
     # Diagnostics dumps
     p.add_argument("--ranking-out", type=Path, default=None, help="Optional ranking frame dump path.")
@@ -153,10 +206,18 @@ def main() -> None:
     clustering_cfg = ClusteringConfig(
         n_clusters=int(args.n_clusters),
         max_iter=int(args.cluster_max_iter),
+        min_cluster_size=int(args.cluster_min_size),
         responsibility_temperature=float(args.cluster_temperature),
         random_state=int(args.seed),
     )
-    news_cfg = NewsConfig(enabled=bool(args.use_news))
+    news_cfg = NewsConfig(
+        enabled=bool(args.use_news),
+        decision_bar=int(args.news_decision_bar),
+        decay_half_life=float(args.news_half_life),
+        svd_components=int(args.news_svd_components),
+        top_entities=int(args.news_top_entities),
+        include_summary_features=not bool(args.no_news_summary),
+    )
 
     cfg = RegimeConfig(
         method=str(args.method),

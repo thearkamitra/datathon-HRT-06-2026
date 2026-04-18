@@ -22,7 +22,7 @@ training/inference.
 from __future__ import annotations
 
 from dataclasses import dataclass, field, replace
-from typing import Iterable, List, Optional, Tuple
+from typing import Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -74,6 +74,10 @@ class SelectionResult:
     bic: float
     log_likelihood: float
     all_runs: List[dict] = field(default_factory=list)
+    # Fold-val MC forecast predictions from the winning candidate, concatenated
+    # across folds (sorted by session). Used as honest OOF predictions so we
+    # don't run a second, redundant CV loop over the same training sessions.
+    winner_oof: Optional[pd.DataFrame] = None
 
     def as_dict(self) -> dict:
         return {
@@ -97,8 +101,15 @@ def _fold_sharpe_for_candidate(
     n_splits: int,
     random_state: int,
     emission_cfg: EmissionConfig,
-) -> Tuple[float, List[float]]:
-    """Run session-level KFold: fit HMM on fold-train, forecast fold-val, Sharpe."""
+    seen_bars: Optional[int] = None,
+) -> Tuple[float, List[float], pd.DataFrame]:
+    """Run session-level KFold: fit HMM on fold-train, forecast fold-val, Sharpe.
+
+    Returns ``(mean_sharpe, per_fold_sharpes, concatenated_fold_val_predictions)``.
+    The third element is the honest OOF frame for the winning candidate (each
+    training session is predicted exactly once, when it sits in the
+    validation fold).
+    """
     sessions = bundle.sessions
     n = sessions.size
     if n < max(4, n_splits):
@@ -115,6 +126,7 @@ def _fold_sharpe_for_candidate(
 
     return_ix = emission_cfg.return_index()
     fold_scores: List[float] = []
+    fold_frames: List[pd.DataFrame] = []
     n_folds = len(indices)
     for fold_ix, (tr_idx, va_idx) in enumerate(indices, start=1):
         # Build fold-train concatenation.
@@ -136,13 +148,14 @@ def _fold_sharpe_for_candidate(
             va_sessions,
             return_index=return_ix,
             config=mc_cfg,
+            seen_bars=seen_bars,
         )
-        preds_va = preds_va.sort_values("session").reset_index(drop=True)
         y_va = y[va_idx]
-        # Align by array position (preds are in per_session order which matches va_idx).
+        # preds come back in va_idx order -> align with y_va directly before sorting.
         positions, _ = apply_sizing(preds_va, sizing_cfg)
         s = float(sharpe(positions * y_va))
         fold_scores.append(s)
+        fold_frames.append(preds_va)
         _tick(
             "selection",
             fold_ix,
@@ -154,7 +167,14 @@ def _fold_sharpe_for_candidate(
 
     finite = [s for s in fold_scores if np.isfinite(s)]
     mean_sharpe = float(np.mean(finite)) if finite else float("-inf")
-    return mean_sharpe, fold_scores
+    oof_frame = (
+        pd.concat(fold_frames, axis=0, ignore_index=True)
+        .sort_values("session")
+        .reset_index(drop=True)
+        if fold_frames
+        else pd.DataFrame()
+    )
+    return mean_sharpe, fold_scores, oof_frame
 
 
 def select_best_hmm(
@@ -165,6 +185,7 @@ def select_best_hmm(
     mc_cfg: MCConfig,
     sizing_cfg: SizingConfig = SizingConfig(),
     select_cfg: SelectionConfig = SelectionConfig(),
+    seen_bars: Optional[int] = None,
 ) -> SelectionResult:
     """Grid-search ``(n_components, covariance_type)`` by BIC + CV Sharpe.
 
@@ -194,7 +215,7 @@ def select_best_hmm(
 
     grid = select_cfg.grid
     runs: List[dict] = []
-    candidates: List[Tuple[HMMHyper, HMMBundle, float, List[float]]] = []
+    candidates: List[Tuple[HMMHyper, HMMBundle, float, List[float], pd.DataFrame]] = []
 
     total_candidates = len(grid.covariance_types) * len(grid.n_components)
     _log(
@@ -244,7 +265,7 @@ def select_best_hmm(
                 f"BIC={bundle_full.bic:,.0f} AIC={bundle_full.aic:,.0f} "
                 f"converged={bundle_full.converged}",
             )
-            mean_sharpe, fold_sharpes = _fold_sharpe_for_candidate(
+            mean_sharpe, fold_sharpes, fold_preds = _fold_sharpe_for_candidate(
                 bundle=bundle,
                 y=y,
                 hyper=hyper,
@@ -253,6 +274,7 @@ def select_best_hmm(
                 n_splits=select_cfg.cv_splits,
                 random_state=select_cfg.cv_random_state,
                 emission_cfg=emission_cfg,
+                seen_bars=seen_bars,
             )
             _log(
                 "selection",
@@ -271,19 +293,19 @@ def select_best_hmm(
                     "converged": bool(bundle_full.converged),
                 }
             )
-            candidates.append((hyper, bundle_full, mean_sharpe, fold_sharpes))
+            candidates.append((hyper, bundle_full, mean_sharpe, fold_sharpes, fold_preds))
 
     if not candidates:
         raise RuntimeError("No HMM candidate fit successfully during selection")
 
-    best_bic = min(b.bic for _, b, _, _ in candidates)
+    best_bic = min(b.bic for _, b, _, _, _ in candidates)
     eligible = [c for c in candidates if c[1].bic <= best_bic + select_cfg.bic_tol]
     if not eligible:
         eligible = list(candidates)
 
     # Pick the Sharpe-maximising candidate; break ties by fewer states (BIC-lower on tie).
     def _key(entry):
-        hyper, b, sharpe_val, _ = entry
+        hyper, b, sharpe_val, _, _ = entry
         return (
             -(sharpe_val if np.isfinite(sharpe_val) else -1e18),
             int(hyper.n_components),
@@ -301,7 +323,7 @@ def select_best_hmm(
                 winner = cand
                 break
 
-    hyper, b, sharpe_val, fold_sharpes = winner
+    hyper, b, sharpe_val, fold_sharpes, fold_preds = winner
     _log(
         "selection",
         f"winner: K={hyper.n_components} cov={hyper.covariance_type} "
@@ -317,4 +339,5 @@ def select_best_hmm(
         bic=float(b.bic),
         log_likelihood=float(b.log_likelihood),
         all_runs=runs,
+        winner_oof=fold_preds,
     )

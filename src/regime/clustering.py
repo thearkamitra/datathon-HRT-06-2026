@@ -24,7 +24,7 @@ the submission choice.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List, Sequence, Tuple
+from typing import List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -38,11 +38,23 @@ from progress import log as _log
 
 @dataclass(frozen=True)
 class ClusteringConfig:
-    """Hyperparameters for the Method-2 clustering loop."""
+    """Hyperparameters for the Method-2 clustering loop.
+
+    The reassignment loop now includes a *cluster-collapse guard*: if a
+    reassignment would drop any cluster below ``min_cluster_size`` members,
+    the step is rejected and the loop stops with the previous iteration's
+    assignments. This prevents the previously observed collapse pattern
+    (sizes going [272, 294, 434] -> [24, 53, 923] on this dataset) where one
+    cluster swallows the data and the other two become outlier-driven noise.
+
+    ``n_clusters=1`` is a supported value: it is equivalent to a single
+    pooled HMM (i.e. Method 1 inside the Method-2 frame) and is useful as
+    a parsimony anchor when doing K search.
+    """
 
     n_clusters: int = 2
     max_iter: int = 5
-    min_cluster_size: int = 50
+    min_cluster_size: int = 100
     # Temperature for the softmax over per-cluster log-likelihoods when we
     # convert them to responsibilities. Lower -> harder assignments.
     responsibility_temperature: float = 1.0
@@ -77,13 +89,18 @@ def _kmeans_init(
     random_state: int,
 ) -> np.ndarray:
     sessions = summary["session"].to_numpy()
+    n = sessions.size
+    if n_clusters <= 1:
+        # K=1 fallback: all sessions to one cluster (Method 2 collapses to
+        # Method 1's pooled HMM, which is a valid parsimony anchor when
+        # evaluating K via --n-clusters sweeps).
+        return np.zeros(n, dtype=np.int64)
     feats = summary.drop(columns=["session"]).to_numpy(dtype=np.float64)
     feats = np.nan_to_num(feats, nan=0.0, posinf=0.0, neginf=0.0)
     scaler = StandardScaler()
     Z = scaler.fit_transform(feats)
     km = KMeans(n_clusters=n_clusters, n_init=10, random_state=random_state)
     labels = km.fit_predict(Z)
-    # Re-index: align label order with session order of ``summary``.
     return np.asarray(labels, dtype=np.int64)
 
 
@@ -187,20 +204,36 @@ def fit_clustered_hmms(
         )
         changed = int((new_assignments != assignments).sum())
         mean_max_resp = float(responsibilities.max(axis=1).mean())
+
+        # Cluster-collapse guard: refuse the reassignment if it would drop any
+        # cluster below ``min_cluster_size``. We then break out of the loop
+        # with the current ``clusters`` already fit (on the current ``assignments``).
+        proposed_sizes = [
+            int(np.sum(new_assignments == k)) for k in range(config.n_clusters)
+        ]
+        collapse = any(
+            sz < config.min_cluster_size for sz in proposed_sizes
+        ) and config.n_clusters > 1
         history.append(
             {
                 "iteration": int(iteration),
                 "assignments_changed": changed,
                 "cluster_sizes": [int(c.size) for c in clusters],
+                "proposed_sizes": proposed_sizes,
                 "mean_max_responsibility": mean_max_resp,
+                "collapse_guard_triggered": bool(collapse),
             }
         )
         _log(
             "clustering",
             f"iter {iteration + 1}/{config.max_iter}: sizes={[c.size for c in clusters]} "
-            f"reassigned={changed} mean_max_resp={mean_max_resp:.3f} "
-            f"cluster LLs={[f'{c.hmm.log_likelihood:,.0f}' for c in clusters]}",
+            f"proposed={proposed_sizes} reassigned={changed} "
+            f"mean_max_resp={mean_max_resp:.3f} "
+            f"cluster LLs={[f'{c.hmm.log_likelihood:,.0f}' for c in clusters]}"
+            + (f" [COLLAPSE GUARD: stopping]" if collapse else ""),
         )
+        if collapse:
+            break
         assignments = new_assignments
         if changed == 0:
             _log("clustering", f"converged after {iteration + 1} iteration(s)")
@@ -219,13 +252,20 @@ def score_sessions_against_clusters(
     clusters: Sequence[ClusterBundle],
     sessions: Sequence[SessionEmissions],
     temperature: float,
+    seen_bars: Optional[int] = None,
 ) -> Tuple[np.ndarray, np.ndarray]:
-    """Return (log-likelihood matrix, responsibilities) for new sessions."""
+    """Return (log-likelihood matrix, responsibilities) for new sessions.
+
+    ``seen_bars`` caps the filtering window so training sessions (which now
+    carry full 100-bar trajectories) are scored against each cluster HMM on
+    the same first-half observability as test sessions.
+    """
     K = len(clusters)
     n = len(sessions)
     ll = np.full((n, K), -np.inf, dtype=np.float64)
     for k, cluster in enumerate(clusters):
         for i, sess in enumerate(sessions):
-            ll[i, k] = score_sequence(cluster.hmm, sess.features)
+            seq = sess.features if seen_bars is None else sess.features[: int(seen_bars)]
+            ll[i, k] = score_sequence(cluster.hmm, seq)
     resp = _responsibilities_from_ll(ll, temperature=temperature)
     return ll, resp

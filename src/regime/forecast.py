@@ -106,6 +106,7 @@ def _state_return_stats(bundle: HMMBundle, return_index: int) -> Tuple[np.ndarra
 def _batch_terminal_posteriors(
     bundle: HMMBundle,
     sessions: Sequence[SessionEmissions],
+    seen_bars: Optional[int] = None,
 ) -> np.ndarray:
     """Return ``(N, K)`` array of terminal-bar posteriors for all sessions.
 
@@ -113,20 +114,30 @@ def _batch_terminal_posteriors(
     sequence input and slices the per-session terminal rows from the result,
     which avoids per-session Python overhead at scale (20k test sessions x
     ~10ms per individual call was the primary runtime hog).
+
+    ``seen_bars`` caps the number of bars used for filtering. When training
+    sessions carry 100 full bars but we want to mimic inference-time filtering
+    over only the first 50, pass ``seen_bars=50``. Sessions shorter than
+    ``seen_bars`` are used in full. ``None`` (default) uses every bar, which
+    is the right setting for test sessions (already 50 bars) or for downstream
+    feature extraction that wants the posterior over the full sequence.
     """
     K = bundle.n_states
     if not sessions:
         return np.zeros((0, K), dtype=np.float64)
 
-    lengths = np.array(
-        [s.features.shape[0] for s in sessions], dtype=np.int64
-    )
+    if seen_bars is None:
+        feature_blocks = [s.features for s in sessions]
+    else:
+        cap = int(seen_bars)
+        feature_blocks = [s.features[:cap] for s in sessions]
+    lengths = np.array([fb.shape[0] for fb in feature_blocks], dtype=np.int64)
     non_empty_mask = lengths > 0
     if not non_empty_mask.any():
         return np.tile(bundle.startprob, (len(sessions), 1))
 
     X = np.concatenate(
-        [s.features for s in sessions if s.features.shape[0] > 0], axis=0
+        [fb for fb, has in zip(feature_blocks, non_empty_mask) if has], axis=0
     )
     gamma = np.asarray(
         bundle.model.predict_proba(X, lengths[non_empty_mask]), dtype=np.float64
@@ -197,7 +208,9 @@ def forecast_sessions_mc(
     *,
     return_index: int,
     config: MCConfig = MCConfig(),
+    seen_bars: Optional[int] = None,
     progress_tag: Optional[str] = None,
+    return_samples: bool = False,
 ) -> pd.DataFrame:
     """Monte-Carlo forecast of ``R = C_end / C_half - 1`` for each session.
 
@@ -212,6 +225,16 @@ def forecast_sessions_mc(
     3. A vectorised state walk of length ``config.horizon`` across all
        sessions x simulations simultaneously (chunked to cap memory).
 
+    ``seen_bars`` caps the filtering window when training sessions ship with
+    full 100-bar trajectories (the HMM is fit on bars 0..99 but inference must
+    only condition on bars 0..49). Test sessions already only have 50 bars so
+    this is a no-op for the submission path.
+
+    ``return_samples=True`` attaches the underlying ``(N, n_sim)`` R-sample
+    matrix to the dataframe ``attrs["R_samples"]`` so callers like
+    :func:`mixture_forecast_from_samples` can resample from the true per-
+    cluster predictive distribution instead of averaging summary quantiles.
+
     Passing ``progress_tag`` logs a single summary line with total elapsed
     time and key output statistics so large inference phases are visible.
     """
@@ -223,7 +246,7 @@ def forecast_sessions_mc(
         )
 
     t0 = _time.time()
-    start_post = _batch_terminal_posteriors(bundle, sessions)
+    start_post = _batch_terminal_posteriors(bundle, sessions, seen_bars=seen_bars)
     state_mean, state_sigma = _state_return_stats(bundle, return_index=return_index)
 
     log_ret_future = _simulate_batch(
@@ -256,6 +279,8 @@ def forecast_sessions_mc(
             "u": u,
         }
     )
+    if return_samples:
+        out.attrs["R_samples"] = R
     if progress_tag is not None:
         _log(
             progress_tag,
@@ -301,59 +326,94 @@ def session_posterior_features(
     return pd.DataFrame(rows).sort_values("session").reset_index(drop=True)
 
 
-def mixture_forecast(
+def mixture_forecast_from_samples(
     frames: Iterable[pd.DataFrame],
     weights: Iterable[Sequence[float]],
+    *,
+    quantiles: Tuple[float, float, float] = (0.1, 0.5, 0.9),
+    rng_seed: int = 0,
 ) -> pd.DataFrame:
-    """Cluster-weighted mixture of per-cluster MC forecasts.
+    """Mathematically correct cluster-weighted mixture forecast.
 
-    Each frame must share the same ``session`` order. ``weights`` is a 2-D
-    iterable of shape ``(K_clusters, n_sessions)`` giving the cluster
-    responsibilities per session. Used by Method 2 to combine cluster-specific
-    forecasts:
+    Each input frame must carry a per-session ``R_samples`` matrix of shape
+    ``(N, n_sim)`` in ``frame.attrs["R_samples"]`` (produced by
+    ``forecast_sessions_mc(..., return_samples=True)``). ``weights`` is a
+    ``(K_clusters, N)`` array of per-session cluster responsibilities.
 
-        mu_i     = sum_k w_{ik} * mu_{ik}
-        p_up_i   = sum_k w_{ik} * p_up_{ik}
-        u_i      = sum_k w_{ik} * u_{ik}  (a simple but reasonable average)
+    For each session ``i`` we draw ``n_sim`` samples from the mixture
+
+        p(R_i) = sum_k w_{ik} * p_k(R_i)
+
+    by (1) sampling a cluster index ``k ~ Cat(w_{i,:})`` per simulation and
+    (2) drawing an R sample from that cluster's predictive distribution.
+    ``mu``, ``p_up``, and the quantile triple are then computed from the
+    resulting mixture sample, which is the right thing to feed to the Sharpe-
+    aware sizer.
+
+    This replaces the previous ``mixture_forecast`` implementation which
+    averaged per-cluster quantiles directly (mathematically wrong for
+    multi-modal mixtures).
     """
     frames = list(frames)
     if not frames:
-        raise ValueError("mixture_forecast requires at least one input frame")
+        raise ValueError("mixture_forecast_from_samples requires at least one frame")
     weights = np.asarray(list(weights), dtype=np.float64)
     if weights.shape[0] != len(frames):
         raise ValueError("weights must have one row per input frame")
 
-    base = frames[0].copy()
-    sessions = base["session"].to_numpy()
-    K = len(frames)
-    wsum = weights.sum(axis=0) + 1e-12
-    weights = weights / wsum  # normalise per session
-
-    mu = np.zeros_like(sessions, dtype=np.float64)
-    p_up = np.zeros_like(sessions, dtype=np.float64)
-    q_lower = np.zeros_like(sessions, dtype=np.float64)
-    q_median = np.zeros_like(sessions, dtype=np.float64)
-    q_upper = np.zeros_like(sessions, dtype=np.float64)
-    u = np.zeros_like(sessions, dtype=np.float64)
-    for k in range(K):
-        f = frames[k]
+    sessions = frames[0]["session"].to_numpy()
+    n_sim = None
+    sample_banks: List[np.ndarray] = []
+    for f in frames:
         if not np.array_equal(f["session"].to_numpy(), sessions):
             raise ValueError("All mixture frames must share the same session ordering")
-        w = weights[k]
-        mu += w * f["mu"].to_numpy(dtype=np.float64)
-        p_up += w * f["p_up"].to_numpy(dtype=np.float64)
-        q_lower += w * f["q_lower"].to_numpy(dtype=np.float64)
-        q_median += w * f["q_median"].to_numpy(dtype=np.float64)
-        q_upper += w * f["q_upper"].to_numpy(dtype=np.float64)
-        u += w * f["u"].to_numpy(dtype=np.float64)
-    return pd.DataFrame(
+        bank = f.attrs.get("R_samples")
+        if bank is None:
+            raise ValueError(
+                "Each cluster frame must carry its R_samples in .attrs. "
+                "Pass return_samples=True to forecast_sessions_mc."
+            )
+        bank = np.asarray(bank, dtype=np.float64)
+        if n_sim is None:
+            n_sim = bank.shape[1]
+        elif bank.shape[1] != n_sim:
+            raise ValueError("Cluster R_samples banks must have matching n_sim")
+        sample_banks.append(bank)
+
+    K = len(frames)
+    N = sessions.size
+    # Normalise weights per session.
+    wsum = weights.sum(axis=0, keepdims=True) + 1e-12
+    w = (weights / wsum).T  # shape (N, K)
+    cum_w = np.cumsum(w, axis=1)  # (N, K)
+    stacked = np.stack(sample_banks, axis=0)  # (K, N, n_sim)
+
+    rng = np.random.default_rng(int(rng_seed))
+    # For each (i, j), pick k s.t. cum_w[i, k-1] <= u < cum_w[i, k].
+    u = rng.random((N, n_sim))
+    cluster_ix = np.sum(u[:, :, None] >= cum_w[:, None, :], axis=2)
+    cluster_ix = np.clip(cluster_ix, 0, K - 1)
+    # Pick a random within-cluster simulation index per draw.
+    sim_ix = rng.integers(0, n_sim, size=(N, n_sim))
+    sess_ix = np.broadcast_to(np.arange(N)[:, None], (N, n_sim))
+    R_mix = stacked[cluster_ix, sess_ix, sim_ix]  # (N, n_sim)
+
+    qs = np.asarray(quantiles, dtype=np.float64)
+    mu = R_mix.mean(axis=1)
+    q = np.quantile(R_mix, qs, axis=1)  # (3, N)
+    spread = np.maximum(q[-1] - q[0], 1e-6)
+    p_up = (R_mix > 0.0).mean(axis=1)
+
+    out = pd.DataFrame(
         {
             "session": sessions,
             "mu": mu,
             "p_up": p_up,
-            "q_lower": q_lower,
-            "q_median": q_median,
-            "q_upper": q_upper,
-            "u": np.maximum(u, 1e-6),
+            "q_lower": q[0],
+            "q_median": q[len(qs) // 2],
+            "q_upper": q[-1],
+            "u": spread,
         }
     )
+    out.attrs["R_samples"] = R_mix
+    return out
