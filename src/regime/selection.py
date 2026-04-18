@@ -31,6 +31,7 @@ from sklearn.model_selection import KFold
 from emissions import EmissionBundle, EmissionConfig
 from forecast import MCConfig, forecast_sessions_mc
 from hmm_model import HMMBundle, HMMHyper, fit_pooled_gaussian_hmm
+from progress import log as _log, tick as _tick
 from sizing import SizingConfig, apply_sizing, sharpe, tune_sizing
 
 
@@ -114,7 +115,8 @@ def _fold_sharpe_for_candidate(
 
     return_ix = emission_cfg.return_index()
     fold_scores: List[float] = []
-    for tr_idx, va_idx in indices:
+    n_folds = len(indices)
+    for fold_ix, (tr_idx, va_idx) in enumerate(indices, start=1):
         # Build fold-train concatenation.
         tr_X = np.concatenate([bundle.per_session[i].features for i in tr_idx], axis=0)
         tr_lengths = np.array(
@@ -123,8 +125,9 @@ def _fold_sharpe_for_candidate(
         )
         try:
             hmm_fold = fit_pooled_gaussian_hmm(tr_X, tr_lengths, hyper=hyper)
-        except Exception:
+        except Exception as exc:
             fold_scores.append(float("nan"))
+            _tick("selection", fold_ix, n_folds, f"CV fold failed: {type(exc).__name__}")
             continue
 
         va_sessions = [bundle.per_session[i] for i in va_idx]
@@ -138,7 +141,16 @@ def _fold_sharpe_for_candidate(
         y_va = y[va_idx]
         # Align by array position (preds are in per_session order which matches va_idx).
         positions, _ = apply_sizing(preds_va, sizing_cfg)
-        fold_scores.append(float(sharpe(positions * y_va)))
+        s = float(sharpe(positions * y_va))
+        fold_scores.append(s)
+        _tick(
+            "selection",
+            fold_ix,
+            n_folds,
+            f"CV fold ({len(tr_idx)} train / {len(va_idx)} val) Sharpe={s:+.3f} "
+            f"[HMM iters={int(getattr(hmm_fold.model.monitor_, 'iter', 0))} "
+            f"converged={hmm_fold.converged}]",
+        )
 
     finite = [s for s in fold_scores if np.isfinite(s)]
     mean_sharpe = float(np.mean(finite)) if finite else float("-inf")
@@ -184,16 +196,35 @@ def select_best_hmm(
     runs: List[dict] = []
     candidates: List[Tuple[HMMHyper, HMMBundle, float, List[float]]] = []
 
+    total_candidates = len(grid.covariance_types) * len(grid.n_components)
+    _log(
+        "selection",
+        f"grid = {total_candidates} candidates "
+        f"(K in {list(grid.n_components)}, cov in {list(grid.covariance_types)}), "
+        f"CV = {select_cfg.cv_splits}-fold, starts = {grid.n_starts}",
+    )
+    cand_ix = 0
     for cov_type in grid.covariance_types:
         for K in grid.n_components:
+            cand_ix += 1
             hyper = replace(
                 base_hyper,
                 n_components=int(K),
                 covariance_type=str(cov_type),
                 n_starts=int(grid.n_starts),
             )
+            _log(
+                "selection",
+                f"candidate {cand_ix}/{total_candidates}: K={K} cov={cov_type} "
+                f"-> fitting pooled HMM on {bundle.sessions.size} sessions",
+            )
             try:
-                bundle_full = fit_pooled_gaussian_hmm(bundle.X, bundle.lengths, hyper=hyper)
+                bundle_full = fit_pooled_gaussian_hmm(
+                    bundle.X,
+                    bundle.lengths,
+                    hyper=hyper,
+                    progress_tag="selection",
+                )
             except Exception as exc:
                 runs.append(
                     {
@@ -202,7 +233,17 @@ def select_best_hmm(
                         "error": repr(exc),
                     }
                 )
+                _log(
+                    "selection",
+                    f"candidate {cand_ix}/{total_candidates}: FAILED ({type(exc).__name__})",
+                )
                 continue
+            _log(
+                "selection",
+                f"candidate {cand_ix}/{total_candidates}: pooled-fit LL={bundle_full.log_likelihood:,.0f} "
+                f"BIC={bundle_full.bic:,.0f} AIC={bundle_full.aic:,.0f} "
+                f"converged={bundle_full.converged}",
+            )
             mean_sharpe, fold_sharpes = _fold_sharpe_for_candidate(
                 bundle=bundle,
                 y=y,
@@ -212,6 +253,11 @@ def select_best_hmm(
                 n_splits=select_cfg.cv_splits,
                 random_state=select_cfg.cv_random_state,
                 emission_cfg=emission_cfg,
+            )
+            _log(
+                "selection",
+                f"candidate {cand_ix}/{total_candidates}: K={K} cov={cov_type} "
+                f"mean CV Sharpe = {mean_sharpe:+.4f} (folds {fold_sharpes})",
             )
             runs.append(
                 {
@@ -256,6 +302,11 @@ def select_best_hmm(
                 break
 
     hyper, b, sharpe_val, fold_sharpes = winner
+    _log(
+        "selection",
+        f"winner: K={hyper.n_components} cov={hyper.covariance_type} "
+        f"CV Sharpe={sharpe_val:+.4f} BIC={b.bic:,.0f}",
+    )
     return SelectionResult(
         bundle=b,
         n_components=int(hyper.n_components),

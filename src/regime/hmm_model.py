@@ -194,6 +194,8 @@ def fit_pooled_gaussian_hmm(
     X: np.ndarray,
     lengths: Iterable[int],
     hyper: HMMHyper = HMMHyper(),
+    *,
+    progress_tag: Optional[str] = None,
 ) -> HMMBundle:
     """Fit a pooled Gaussian HMM to the multi-sequence training data.
 
@@ -201,7 +203,12 @@ def fit_pooled_gaussian_hmm(
     ``hyper.random_state`` and keeps the highest-likelihood converged fit.
     Falls back to the highest-likelihood *any* fit when no restart converges
     (which should be rare for 1000 sequences of length 50).
+
+    Passing ``progress_tag`` logs a one-line summary per EM restart to
+    :mod:`progress` so the user can see the fit is advancing.
     """
+    from progress import log as _log_progress
+
     X = np.ascontiguousarray(np.asarray(X, dtype=np.float64))
     lengths = np.asarray(list(lengths), dtype=np.int64)
     if X.size == 0 or lengths.size == 0:
@@ -226,6 +233,11 @@ def fit_pooled_gaussian_hmm(
                 all_conv.append(False)
                 if best is None:
                     best = (float("-inf"), model, False)
+                if progress_tag is not None:
+                    _log_progress(
+                        progress_tag,
+                        f"restart {start_ix + 1}/{hyper.n_starts} failed: {type(exc).__name__}",
+                    )
                 continue
         if hyper.floor_covariance:
             _apply_covariance_floor(model, X, hyper.min_covar)
@@ -234,6 +246,7 @@ def fit_pooled_gaussian_hmm(
         except Exception:  # pragma: no cover - fallback for degenerate fits
             ll = float("-inf")
         converged = bool(getattr(model.monitor_, "converged", False))
+        iters = int(getattr(model.monitor_, "iter", 0))
         all_lls.append(ll)
         all_conv.append(converged)
 
@@ -244,6 +257,13 @@ def fit_pooled_gaussian_hmm(
         )
         if better:
             best = (ll, model, converged)
+
+        if progress_tag is not None:
+            _log_progress(
+                progress_tag,
+                f"restart {start_ix + 1}/{hyper.n_starts}: "
+                f"LL={ll:,.0f} iters={iters} converged={converged}",
+            )
 
     assert best is not None
     best_ll, best_model, best_conv = best

@@ -35,6 +35,7 @@ import pandas as pd
 
 from emissions import SessionEmissions
 from hmm_model import HMMBundle, occupancy_features  # noqa: F401  (re-exported)
+from progress import log as _log
 
 
 @dataclass(frozen=True)
@@ -196,6 +197,7 @@ def forecast_sessions_mc(
     *,
     return_index: int,
     config: MCConfig = MCConfig(),
+    progress_tag: Optional[str] = None,
 ) -> pd.DataFrame:
     """Monte-Carlo forecast of ``R = C_end / C_half - 1`` for each session.
 
@@ -209,12 +211,18 @@ def forecast_sessions_mc(
        terminal-bar posteriors.
     3. A vectorised state walk of length ``config.horizon`` across all
        sessions x simulations simultaneously (chunked to cap memory).
+
+    Passing ``progress_tag`` logs a single summary line with total elapsed
+    time and key output statistics so large inference phases are visible.
     """
+    import time as _time
+
     if not sessions:
         return pd.DataFrame(
             columns=["session", "mu", "p_up", "q_lower", "q_median", "q_upper", "u"]
         )
 
+    t0 = _time.time()
     start_post = _batch_terminal_posteriors(bundle, sessions)
     state_mean, state_sigma = _state_return_stats(bundle, return_index=return_index)
 
@@ -237,7 +245,7 @@ def forecast_sessions_mc(
     p_up = (R > 0.0).mean(axis=1)
 
     sess_ids = np.array([int(s.session) for s in sessions], dtype=np.int64)
-    return pd.DataFrame(
+    out = pd.DataFrame(
         {
             "session": sess_ids,
             "mu": mu,
@@ -248,6 +256,14 @@ def forecast_sessions_mc(
             "u": u,
         }
     )
+    if progress_tag is not None:
+        _log(
+            progress_tag,
+            f"MC forecast {len(sessions)} sessions x {config.n_sim} sims "
+            f"in {_time.time() - t0:.1f}s "
+            f"(mu mean={float(out['mu'].mean()):+.5f}, p_up mean={float(out['p_up'].mean()):.3f})",
+        )
+    return out
 
 
 def session_posterior_features(

@@ -53,6 +53,7 @@ from paths import (
     BARS_SEEN_PUBLIC_TEST,
     BARS_SEEN_TRAIN,
 )
+from progress import log as _log, reset_clock
 from selection import SelectionConfig, SelectionResult, select_best_hmm
 from sizing import (
     SizingConfig,
@@ -146,15 +147,24 @@ def _oof_forecasts_m1(
         splits = list(kf.split(order))
 
     oof_rows: List[pd.DataFrame] = []
-    for tr_idx, va_idx in splits:
+    total = len(splits)
+    for fold_ix, (tr_idx, va_idx) in enumerate(splits, start=1):
+        _log(
+            "oof",
+            f"fold {fold_ix}/{total}: fitting HMM on {len(tr_idx)} train sessions, "
+            f"forecasting {len(va_idx)} val sessions",
+        )
         tr_bundle = _subset_bundle(bundle, tr_idx)
-        hmm_fold = fit_pooled_gaussian_hmm(tr_bundle.X, tr_bundle.lengths, hyper=hyper)
+        hmm_fold = fit_pooled_gaussian_hmm(
+            tr_bundle.X, tr_bundle.lengths, hyper=hyper, progress_tag="oof"
+        )
         va_sessions = [bundle.per_session[i] for i in va_idx]
         preds = forecast_sessions_mc(
             hmm_fold,
             va_sessions,
             return_index=return_index,
             config=mc_cfg,
+            progress_tag="oof",
         )
         oof_rows.append(preds)
     oof = pd.concat(oof_rows, axis=0, ignore_index=True)
@@ -185,7 +195,13 @@ def _oof_forecasts_m2(
         splits = list(kf.split(order))
 
     oof_rows: List[pd.DataFrame] = []
-    for tr_idx, va_idx in splits:
+    total = len(splits)
+    for fold_ix, (tr_idx, va_idx) in enumerate(splits, start=1):
+        _log(
+            "oof",
+            f"fold {fold_ix}/{total}: clustering {len(tr_idx)} train sessions, "
+            f"forecasting {len(va_idx)} val sessions",
+        )
         tr_bundle = _subset_bundle(bundle, tr_idx)
         clustering = fit_clustered_hmms(tr_bundle, hyper=hyper, config=cluster_cfg)
         va_sessions = [bundle.per_session[i] for i in va_idx]
@@ -196,7 +212,8 @@ def _oof_forecasts_m2(
         )
         per_cluster_frames = [
             forecast_sessions_mc(
-                c.hmm, va_sessions, return_index=return_index, config=mc_cfg
+                c.hmm, va_sessions, return_index=return_index, config=mc_cfg,
+                progress_tag="oof",
             )
             for c in clustering.clusters
         ]
@@ -218,15 +235,34 @@ def run_pipeline(
     config: RegimeConfig = RegimeConfig(),
 ) -> RegimeResult:
     data_dir = Path(data_dir)
+    reset_clock()
+    _log(
+        "pipeline",
+        f"method={config.method} seed={config.random_state} "
+        f"data_dir={data_dir} oof_splits={config.oof_splits} "
+        f"mc(horizon={config.mc.horizon}, n_sim={config.mc.n_sim}, "
+        f"emission_noise={config.mc.emission_noise})",
+    )
 
     # ---- Train emissions + labels -----------------------------------------
+    _log("emissions", f"loading {BARS_SEEN_TRAIN}")
     bars_tr = pd.read_parquet(data_dir / BARS_SEEN_TRAIN)
     emissions_tr = build_emission_bundle(bars_tr, config.emission)
     if emissions_tr.sessions.size == 0:
         raise RuntimeError("No training sessions found while building emissions.")
+    _log(
+        "emissions",
+        f"train: {emissions_tr.sessions.size} sessions x "
+        f"{int(emissions_tr.lengths[0])} bars x {emissions_tr.X.shape[1]} features",
+    )
 
     labels = train_realized_returns(data_dir)
     y_tr = _align_y_to_bundle(labels, emissions_tr)
+    _log(
+        "labels",
+        f"train R: mean={float(np.mean(y_tr)):+.5f} std={float(np.std(y_tr, ddof=0)):.5f} "
+        f"flat-long Sharpe={16.0 * float(np.mean(y_tr)) / max(float(np.std(y_tr, ddof=0)), 1e-12):+.3f}",
+    )
 
     return_index = config.emission.return_index()
 
@@ -242,6 +278,7 @@ def run_pipeline(
 
     if config.method == "m1":
         # ---- Level-1 + Level-2 model selection -----------------------------
+        _log("pipeline", "phase 1/4: HMM state-count selection (BIC + CV Sharpe)")
         selection_result = select_best_hmm(
             bundle=emissions_tr,
             y=y_tr,
@@ -270,6 +307,10 @@ def run_pipeline(
             floor_covariance=config.hmm.floor_covariance,
         )
         # ---- OOF forecasts for sizer tuning --------------------------------
+        _log(
+            "pipeline",
+            f"phase 2/4: OOF forecasts ({config.oof_splits}-fold) with selected HMM",
+        )
         oof_preds = _oof_forecasts_m1(
             emissions_tr,
             hyper=winning_hyper,
@@ -279,6 +320,11 @@ def run_pipeline(
             random_state=config.random_state,
         )
     elif config.method == "m2":
+        _log(
+            "pipeline",
+            f"phase 1/4: OOF clustered-HMM forecasts ({config.oof_splits}-fold, "
+            f"K_clusters={config.clustering.n_clusters})",
+        )
         oof_preds = _oof_forecasts_m2(
             emissions_tr,
             hyper=config.hmm,
@@ -298,11 +344,23 @@ def run_pipeline(
     y_aligned = labels_sorted["R"].to_numpy(dtype=np.float64)
 
     # ---- Tune the Sharpe-aware sizer --------------------------------------
+    _log(
+        "pipeline",
+        f"phase {'3' if config.method == 'm1' else '2'}/4: tune Sharpe-aware sizer on OOF",
+    )
     tuned_cfg, tune_info = tune_sizing(
         oof_preds,
         y_aligned,
         target_scale=config.target_scale,
         clip_quantile=config.clip_quantile,
+    )
+    _log(
+        "sizing",
+        f"tuned: mode={tuned_cfg.mode} alpha={tuned_cfg.alpha} "
+        f"lambda={tuned_cfg.lam} theta={tuned_cfg.theta} "
+        f"tau_q={tuned_cfg.tau_quantile} allow_short={tuned_cfg.allow_short} "
+        f"grid_size={tune_info['grid_size']} best_OOF_Sharpe={tune_info['grid_best_sharpe']:+.4f} "
+        f"(flat-long {tune_info['flat_long_sharpe']:+.4f})",
     )
 
     # Supplementary OOF diagnostics.
@@ -315,23 +373,48 @@ def run_pipeline(
     )
 
     # ---- Retrain on full train + predict for test -------------------------
+    _log(
+        "pipeline",
+        f"phase {'4/4' if config.method == 'm1' else '3/4'}: retrain on full train + forecast test",
+    )
+    _log("emissions", f"loading {BARS_SEEN_PUBLIC_TEST} + {BARS_SEEN_PRIVATE_TEST}")
     bars_pub = pd.read_parquet(data_dir / BARS_SEEN_PUBLIC_TEST)
     bars_priv = pd.read_parquet(data_dir / BARS_SEEN_PRIVATE_TEST)
     bars_te = pd.concat([bars_pub, bars_priv], ignore_index=True)
     emissions_te = build_session_emissions(bars_te, config.emission)
+    _log("emissions", f"test: {len(emissions_te)} sessions built")
 
     if config.method == "m1":
+        _log(
+            "final",
+            f"fitting HMM on full {emissions_tr.sessions.size} train sessions "
+            f"(K={winning_hyper.n_components}, cov={winning_hyper.covariance_type})",
+        )
         final_hmm = fit_pooled_gaussian_hmm(
-            emissions_tr.X, emissions_tr.lengths, hyper=winning_hyper
+            emissions_tr.X,
+            emissions_tr.lengths,
+            hyper=winning_hyper,
+            progress_tag="final",
+        )
+        _log(
+            "final",
+            f"HMM state means (return channel) = "
+            f"{np.round(final_hmm.means[:, return_index], 5).tolist()}",
         )
         preds_te = forecast_sessions_mc(
             final_hmm,
             emissions_te,
             return_index=return_index,
             config=config.mc,
+            progress_tag="final",
         )
         hmm_bundle_for_diag = final_hmm
     else:
+        _log(
+            "final",
+            f"fitting clustered HMMs on full {emissions_tr.sessions.size} train sessions "
+            f"(K_clusters={config.clustering.n_clusters}, K_states={winning_hyper.n_components})",
+        )
         clustering_result = fit_clustered_hmms(
             emissions_tr, hyper=winning_hyper, config=config.clustering
         )
@@ -342,12 +425,20 @@ def run_pipeline(
         )
         per_cluster_frames = [
             forecast_sessions_mc(
-                c.hmm, emissions_te, return_index=return_index, config=config.mc
+                c.hmm,
+                emissions_te,
+                return_index=return_index,
+                config=config.mc,
+                progress_tag=f"final/cluster{k}",
             )
-            for c in clustering_result.clusters
+            for k, c in enumerate(clustering_result.clusters)
         ]
         preds_te = mixture_forecast(per_cluster_frames, weights=test_resp.T)
         hmm_bundle_for_diag = clustering_result.clusters[0].hmm
+        _log(
+            "final",
+            f"mixture forecast blended over {len(per_cluster_frames)} clusters",
+        )
 
     preds_te = preds_te.sort_values("session").reset_index(drop=True)
     positions_te = size_with_fallback(preds_te, tuned_cfg)
@@ -355,6 +446,18 @@ def run_pipeline(
         preds_te["session"].to_numpy(), preds_te, positions_te
     )
     submission = rankings[["session", "target_position"]].copy()
+    pos = rankings["target_position"].to_numpy()
+    _log(
+        "submission",
+        f"sized positions: mean={pos.mean():+.4f} std={pos.std():.4f} "
+        f"neg_frac={float((pos < 0).mean()):.3f} "
+        f"|p|_range=[{abs(pos).min():.4f}, {abs(pos).max():.4f}]",
+    )
+    _log(
+        "pipeline",
+        f"OOF Sharpe (tuned) = {float(oof_sharpe):+.4f} vs flat-long {float(always_long_sharpe):+.4f} "
+        f"(sign(mu)={float(sign_only_sharpe):+.3f}, sign(p_up)={float(p_sign_sharpe):+.3f})",
+    )
 
     # ---- Diagnostics -------------------------------------------------------
     diagnostics: dict = {

@@ -33,6 +33,7 @@ from sklearn.preprocessing import StandardScaler
 
 from emissions import EmissionBundle, SessionEmissions, session_summary_features
 from hmm_model import HMMBundle, HMMHyper, fit_pooled_gaussian_hmm, score_sequence
+from progress import log as _log
 
 
 @dataclass(frozen=True)
@@ -147,6 +148,11 @@ def fit_clustered_hmms(
     assignments = _kmeans_init(
         summary, n_clusters=config.n_clusters, random_state=config.random_state
     )
+    init_sizes = [int(np.sum(assignments == k)) for k in range(config.n_clusters)]
+    _log(
+        "clustering",
+        f"initial K-means assignment: cluster_sizes={init_sizes}",
+    )
 
     history: List[dict] = []
     responsibilities = np.zeros((n, config.n_clusters), dtype=np.float64)
@@ -180,16 +186,24 @@ def fit_clustered_hmms(
             cluster_lls, temperature=config.responsibility_temperature
         )
         changed = int((new_assignments != assignments).sum())
+        mean_max_resp = float(responsibilities.max(axis=1).mean())
         history.append(
             {
                 "iteration": int(iteration),
                 "assignments_changed": changed,
                 "cluster_sizes": [int(c.size) for c in clusters],
-                "mean_max_responsibility": float(responsibilities.max(axis=1).mean()),
+                "mean_max_responsibility": mean_max_resp,
             }
+        )
+        _log(
+            "clustering",
+            f"iter {iteration + 1}/{config.max_iter}: sizes={[c.size for c in clusters]} "
+            f"reassigned={changed} mean_max_resp={mean_max_resp:.3f} "
+            f"cluster LLs={[f'{c.hmm.log_likelihood:,.0f}' for c in clusters]}",
         )
         assignments = new_assignments
         if changed == 0:
+            _log("clustering", f"converged after {iteration + 1} iteration(s)")
             break
 
     return ClusteringResult(
