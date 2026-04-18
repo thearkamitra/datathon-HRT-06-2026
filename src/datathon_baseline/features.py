@@ -6,12 +6,18 @@ import numpy as np
 import pandas as pd
 
 
-def build_session_features(bars: pd.DataFrame) -> pd.DataFrame:
+def build_session_features(bars: pd.DataFrame, headlines: pd.DataFrame | None = None) -> pd.DataFrame:
     """
     One row per session. `bars` must contain only bars available at decision time
     (train seen or test seen: bar_ix 0..49).
     """
     rows: list[dict] = []
+    
+    # Pre-calculate headline counts if provided
+    h_counts = {}
+    if headlines is not None and not headlines.empty:
+        h_counts = headlines.groupby("session").size().to_dict()
+
     for session, g in bars.groupby("session", sort=False):
         g = g.sort_values("bar_ix")
         if g.empty:
@@ -34,6 +40,7 @@ def build_session_features(bars: pd.DataFrame) -> pd.DataFrame:
                 "max_high": hi,
                 "min_low": lo,
                 "mean_bar_ret": float(rets.mean()),
+                "headline_count": h_counts.get(int(session), 0),
             }
         )
     out = pd.DataFrame(rows)
@@ -51,4 +58,5 @@ FEATURE_COLUMNS = [
     "max_high",
     "min_low",
     "mean_bar_ret",
+    "headline_count",
 ]
