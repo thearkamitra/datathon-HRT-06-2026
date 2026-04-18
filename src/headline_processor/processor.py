@@ -32,7 +32,10 @@ class Processor:
             if key in lookup:
                 h = lookup[key]
                 h.company = row.get('company')
+                h.granular_sector = row.get('granular_sector')
+                h.sector = row.get('sector')
                 h.sentiment = row.get('sentiment')
+                h.sentiment_score = row.get('sentiment_score')
                 h.confidence = row.get('confidence')
                 h.reasoning = row.get('reasoning')
                 
@@ -40,32 +43,73 @@ class Processor:
                 if h.company:
                     self.collection._index_by_company(h)
 
-    def _process_single_session(self, session_id: int, headline_limit: Optional[int] = None):
+    def map_granular_sectors(self, predictor):
+        """
+        Collects all unique granular sectors and maps them to broad sectors using the LLM.
+        """
+        unique_granular = set()
+        for h in self.collection.headlines:
+            if h.granular_sector:
+                unique_granular.add(h.granular_sector)
+        
+        if not unique_granular:
+            return
+
+        prompt = f"""
+        Map the following granular industrial sectors to broad categories 
+        (e.g., Technology, Healthcare, Energy, Finance, Consumer Goods, Industrials, etc.).
+        
+        Sectors: {", ".join(sorted(list(unique_granular)))}
+        
+        Respond with a JSON object where keys are granular sectors and values are broad categories.
+        Example: {{"Biosciences": "Healthcare", "Renewables": "Energy"}}
+        """
+        
+        try:
+            mapping = predictor.predict_json(prompt)
+            for h in self.collection.headlines:
+                if h.granular_sector in mapping:
+                    h.sector = mapping[h.granular_sector]
+        except Exception as e:
+            print(f"Error mapping sectors: {e}")
+
+    def _process_single_session(self, session_id: int, headline_limit: Optional[int] = None, batch_size: int = 5):
         headlines = sorted(self.collection.get_session_headlines(session_id), key=lambda x: x.bar_ix)
         if headline_limit:
             headlines = headlines[:headline_limit]
         
+        # Group by bar_ix for potential batching
+        from collections import defaultdict
+        by_bar = defaultdict(list)
         for h in headlines:
-            # Skip if already processed
-            if h.sentiment is not None:
-                continue
-                
-            # 1. Initial prediction to get company
-            h.predict_sentiment(self.predictor)
-            
-            # If company was identified, we might want to re-run with history
-            if h.company:
-                # Re-index to ensure history lookup works
-                self.collection._index_by_company(h)
+            if h.sentiment is None:
+                by_bar[h.bar_ix].append(h)
 
-                history = self.collection.get_company_history(h.company, h.session, h.bar_ix, global_history=True)
-                if history:
-                    # Re-predict with history context
-                    h.predict_sentiment(self.predictor, history=history)
+        bars = sorted(by_bar.keys())
+        for bar in bars:
+            bar_headlines = by_bar[bar]
+            # Further split into batches if too many headlines in a single bar
+            for i in range(0, len(bar_headlines), batch_size):
+                batch = bar_headlines[i:i+batch_size]
+                
+                # 1. Initial batch prediction
+                Headline.predict_batch(self.predictor, batch)
+                
+                # After batch prediction, if company is identified, we might want to check for history.
+                # To keep it fast, we only do history-based re-prediction for high-confidence ones OR individually.
+                for h in batch:
+                    if h.company:
+                        self.collection._index_by_company(h)
+                        
+                        # Optional: History-aware re-prediction if desired. 
+                        # For speed, we might skip this in the initial pass.
+                        # history = self.collection.get_company_history(h.company, h.session, h.bar_ix, global_history=True)
+                        # if history:
+                        #     h.predict_sentiment(self.predictor, history=history)
 
         return session_id
 
-    def process_headlines(self, session_limit: Optional[int] = None, headline_limit_per_session: Optional[int] = None, max_workers: int = 5):
+    def process_headlines(self, session_limit: Optional[int] = None, headline_limit_per_session: Optional[int] = None, max_workers: int = 5, batch_size: int = 5):
         """
         Processes headlines to identify companies and sentiment.
         Uses ThreadPoolExecutor for concurrent session processing.
@@ -85,10 +129,10 @@ class Processor:
             print("All requested sessions are already processed.")
             return
 
-        print(f"Processing {len(sessions_to_process)} sessions with {max_workers} workers...")
+        print(f"Processing {len(sessions_to_process)} sessions with {max_workers} workers (Batch size: {batch_size})...")
         
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(self._process_single_session, s, headline_limit_per_session) for s in sessions_to_process]
+            futures = [executor.submit(self._process_single_session, s, headline_limit_per_session, batch_size) for s in sessions_to_process]
             for _ in tqdm(as_completed(futures), total=len(sessions_to_process), desc="Processing Sessions"):
                 pass
 
@@ -101,7 +145,10 @@ class Processor:
                     "bar_ix": h.bar_ix,
                     "headline": h.text,
                     "company": h.company,
+                    "granular_sector": h.granular_sector,
+                    "sector": h.sector,
                     "sentiment": h.sentiment,
+                    "sentiment_score": h.sentiment_score,
                     "confidence": h.confidence,
                     "reasoning": h.reasoning
                 })
@@ -126,10 +173,13 @@ class Processor:
             for h in sorted_h:
                 data.append({
                     "company": co,
+                    "granular_sector": h.granular_sector,
+                    "sector": h.sector,
                     "associated_sessions": associated_sessions,
                     "session": h.session,
                     "bar_ix": h.bar_ix,
                     "sentiment": h.sentiment,
+                    "sentiment_score": h.sentiment_score,
                     "confidence": h.confidence,
                     "headline": h.text,
                     "reasoning": h.reasoning

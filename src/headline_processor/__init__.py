@@ -10,6 +10,7 @@ def get_or_process_file(
     session_limit: Optional[int] = None, 
     headline_limit: Optional[int] = None,
     max_workers: int = 5,
+    batch_size: int = 5,
     **predictor_kwargs
 ) -> Processor:
     """
@@ -38,9 +39,18 @@ def get_or_process_file(
     processor.process_headlines(
         session_limit=session_limit, 
         headline_limit_per_session=headline_limit,
-        max_workers=max_workers
+        max_workers=max_workers,
+        batch_size=batch_size
     )
     
+    # NEW: Map sectors using LLM at the very end (if not already mapped)
+    # We use a separate predictor instance for this to ensure we use Gemini/Ollama
+    from src.predictor.predictor import get_predictor
+    llm_provider = "gemini" if provider == "finbert" else provider
+    llm_predictor = get_predictor(llm_provider)
+    print(f"Mapping granular sectors using {llm_provider}...")
+    processor.map_granular_sectors(llm_predictor)
+
     # Save the results if we did some work
     # We always save if we processed everything to ensure we have a complete cache
     results_df = processor.get_results_df()
