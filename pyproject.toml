@@ -13,6 +13,9 @@ dependencies = [
     "requests",
     "tqdm",
     "scikit-learn>=1.6.1",
+    "scipy>=1.10",
+    "streamlit>=1.32",
+    "plotly>=5.18",
 ]
 
 [project.scripts]
