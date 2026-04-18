@@ -7,7 +7,7 @@ def main():
     load_dotenv()
     
     parser = argparse.ArgumentParser(description="Financial Headline Sentiment Analysis")
-    parser.add_argument("--provider", type=str, default="gemini", choices=["gemini", "ollama"], help="LLM provider")
+    parser.add_argument("--provider", type=str, default="gemini", choices=["gemini", "ollama", "finbert"], help="LLM provider (finbert for local fast scoring)")
     parser.add_argument("--model", type=str, help="Model name (optional)")
     parser.add_argument("--sessions", type=int, help="Number of sessions to process (default: all sessions in file)")
     parser.add_argument("--limit", type=int, help="Headlines per session limit (default: all headlines in session)")
@@ -46,8 +46,9 @@ def main():
                 print("-" * (9 + len(company)))
                 for _, row in group.iterrows():
                     move = "▲ BUY" if row['sentiment'] == 'buy' else "▼ SELL"
+                    score = f"[{row['sentiment_score'] or 0:+.2f}]"
                     conf = f"({row['confidence']*100:3.0f}%)" if row['confidence'] is not None else ""
-                    print(f"S{row['session']} | Bar {row['bar_ix']:3} | {move:7} {conf:6} | {row['headline']}")
+                    print(f"S{row['session']} | Bar {row['bar_ix']:3} | {move:7} {score:7} {conf:6} | {row['headline']}")
         else:
             print("No company data found or processed.")
         

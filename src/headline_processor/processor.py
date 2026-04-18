@@ -33,6 +33,7 @@ class Processor:
                 h = lookup[key]
                 h.company = row.get('company')
                 h.sentiment = row.get('sentiment')
+                h.sentiment_score = row.get('sentiment_score')
                 h.confidence = row.get('confidence')
                 h.reasoning = row.get('reasoning')
                 
@@ -113,6 +114,7 @@ class Processor:
                     "headline": h.text,
                     "company": h.company,
                     "sentiment": h.sentiment,
+                    "sentiment_score": h.sentiment_score,
                     "confidence": h.confidence,
                     "reasoning": h.reasoning
                 })
@@ -141,6 +143,7 @@ class Processor:
                     "session": h.session,
                     "bar_ix": h.bar_ix,
                     "sentiment": h.sentiment,
+                    "sentiment_score": h.sentiment_score,
                     "confidence": h.confidence,
                     "headline": h.text,
                     "reasoning": h.reasoning

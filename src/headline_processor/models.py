@@ -9,12 +9,13 @@ class Headline:
     text: str
     company: Optional[str] = None
     sentiment: Optional[str] = None  # "buy" or "sell"
+    sentiment_score: Optional[float] = None # -1.0 to 1.0
     confidence: Optional[float] = None # 0.0 to 1.0
     reasoning: Optional[str] = None
     history_context: List[str] = field(default_factory=list)
     
     def __repr__(self):
-        return f"Headline(session={self.session}, bar_ix={self.bar_ix}, company={self.company}, sentiment={self.sentiment}, conf={self.confidence})"
+        return f"Headline(session={self.session}, bar_ix={self.bar_ix}, company={self.company}, sentiment={self.sentiment}, score={self.sentiment_score})"
 
     @staticmethod
     def predict_batch(predictor, headlines: List['Headline'], history_map: Dict[str, List['Headline']] = None):
@@ -24,13 +25,27 @@ class Headline:
         if not headlines:
             return
 
+        # Simple company extraction: first word or first two words (check for ' Biosciences', etc)
+        # For this specific dataset, we assume first word is enough as per user instruction.
+        for h in headlines:
+            if h.company is None:
+                h.company = h.text.split()[0]
+
+        # Check if predictor is FinBERT for optimized local batching
+        from src.predictor.predictor import FinBertPredictor
+        if isinstance(predictor, FinBertPredictor):
+            texts = [h.text for h in headlines]
+            results = predictor.predict_batch_json(texts)
+            for h, res in zip(headlines, results):
+                h.sentiment_score = res.get("sentiment_score")
+                h.sentiment = res.get("sentiment")
+                h.confidence = res.get("confidence")
+                h.reasoning = res.get("reasoning")
+            return
+
+        # Fallback for LLMs (JSON Batching)
         headlines_data = []
         for i, h in enumerate(headlines):
-            context_str = ""
-            # If we have a hint about company or global history, we might include it.
-            # However, for initial batching, we usually don't know the company yet.
-            # We can include general recent history for the session if needed.
-            
             headlines_data.append({
                 "id": i,
                 "text": h.text,

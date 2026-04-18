@@ -3,8 +3,8 @@ import json
 import requests
 import time
 import threading
+from typing import Optional, Dict, Any, List
 from google import genai
-from typing import Optional, Dict, Any
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -112,10 +112,97 @@ class OllamaPredictor(BasePredictor):
     def get_model_name(self) -> str:
         return self.model_name
 
+class FinBertPredictor(BasePredictor):
+    def __init__(self, model_name: str = "ProsusAI/finbert"):
+        import torch
+        from transformers import AutoTokenizer, AutoModelForSequenceClassification
+        
+        self.model_name = model_name
+        self.tokenizer = AutoTokenizer.from_pretrained(model_name)
+        
+        # Check for Apple Silicon (MPS)
+        if torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+            # print("Using MPS (Metal) for FinBERT acceleration.")
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        else:
+            self.device = torch.device("cpu")
+            
+        self.model = AutoModelForSequenceClassification.from_pretrained(model_name).to(self.device)
+        self.model.eval()
+
+    def predict(self, text: str) -> str:
+        """Returns the raw label for single headline."""
+        import torch
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+            # labels: 0: positive, 1: negative, 2: neutral
+            conf, idx = torch.max(probs, dim=-1)
+            labels = ["positive", "negative", "neutral"]
+            return f"{labels[idx.item()]} (conf: {conf.item():.4f})"
+
+    def predict_json(self, text: str) -> Dict[str, Any]:
+        """Returns structured sentiment info with -1 to 1 score."""
+        import torch
+        inputs = self.tokenizer(text, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+            
+            # ProsusAI/finbert labels: 0 -> positive, 1 -> negative, 2 -> neutral
+            p_pos = probs[0][0].item()
+            p_neg = probs[0][1].item()
+            p_neu = probs[0][2].item()
+            
+            # Calculate continuous score: -1 to 1
+            # Simple approach: Pos probability - Neg probability
+            sentiment_score = p_pos - p_neg
+            
+            # Map back to buy/sell for consistency with existing code
+            sentiment_label = "buy" if sentiment_score > 0 else "sell"
+            
+            return {
+                "sentiment_score": round(sentiment_score, 4),
+                "sentiment": sentiment_label,
+                "confidence": round(max(p_pos, p_neg, p_neu), 4),
+                "reasoning": f"FinBERT Score: {sentiment_score:.2f} (Pos: {p_pos:.2f}, Neg: {p_neg:.2f}, Neu: {p_neu:.2f})"
+            }
+
+    def predict_batch_json(self, texts: List[str]) -> List[Dict[str, Any]]:
+        """Efficient batch processing for FinBERT."""
+        import torch
+        inputs = self.tokenizer(texts, return_tensors="pt", padding=True, truncation=True).to(self.device)
+        with torch.no_grad():
+            outputs = self.model(**inputs)
+            probs = torch.nn.functional.softmax(outputs.logits, dim=-1)
+            
+            results = []
+            for i in range(len(texts)):
+                p_pos = probs[i][0].item()
+                p_neg = probs[i][1].item()
+                p_neu = probs[i][2].item()
+                
+                score = p_pos - p_neg
+                results.append({
+                    "sentiment_score": round(score, 4),
+                    "sentiment": "buy" if score > 0 else "sell",
+                    "confidence": round(max(p_pos, p_neg, p_neu), 4),
+                    "reasoning": f"FinBERT Score: {score:.2f}"
+                })
+            return results
+
+    def get_model_name(self) -> str:
+        return self.model_name
+
 def get_predictor(provider: str = "gemini", **kwargs) -> BasePredictor:
     if provider.lower() == "gemini":
         return GeminiPredictor(**kwargs)
     elif provider.lower() == "ollama":
         return OllamaPredictor(**kwargs)
+    elif provider.lower() == "finbert":
+        return FinBertPredictor(**kwargs)
     else:
         raise ValueError(f"Unknown provider: {provider}")
