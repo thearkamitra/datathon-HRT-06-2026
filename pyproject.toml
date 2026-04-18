@@ -13,6 +13,7 @@ dependencies = [
     "requests",
     "tqdm",
     "scikit-learn>=1.6.1",
+    "matplotlib>=3.9.4",
 ]
 
 [project.scripts]
