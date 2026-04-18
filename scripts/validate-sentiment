@@ -1,0 +1,203 @@
+#!/usr/bin/env python3
+"""Sentiment <-> price-movement validator.
+
+For each split we have data for (train-seen, train-unseen, public-test,
+private-test) this script runs three layers of validation:
+
+1. **Event-level correlation at multiple horizons** - for each sentiment
+   event at ``bar_ix``, we align it with the forward log-return
+   ``log(close[bar_ix + k]) - log(close[bar_ix])`` and compute Pearson /
+   Spearman / sign-hit-rate between ``sentiment_score`` (and buy/sell sign)
+   and the forward return. The "news impact decays" prior predicts that
+   correlation magnitude should fall as ``k`` grows.
+
+2. **Confidence stratification** - repeat the event-level analysis for
+   high-confidence headlines (>= 0.9) vs the rest. A genuine signal should
+   show a higher correlation among high-confidence headlines.
+
+3. **Session-level aggregates vs train label R** - on train we have the
+   unseen half, so we can test the ultimate question: does a decay-weighted
+   session-level sentiment aggregate correlate with the realised trade
+   return ``R = close_end / close_half - 1`` that the competition scores?
+
+Output: a human-readable summary printed to stdout and per-split CSVs in
+``--out-dir`` (default ``Submissions/sentiment_validation/``).
+
+Usage::
+
+    python scripts/validate-sentiment
+    python scripts/validate-sentiment --n-boot 500 --out-dir reports/sentiment
+"""
+
+from __future__ import annotations
+
+import argparse
+import sys
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TM_DIR = _REPO_ROOT / "src" / "tailored-modeler"
+for _p in (_TM_DIR,):
+    sp = str(_p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+import pandas as pd  # noqa: E402
+
+from paths import data_dir as default_data_dir  # noqa: E402
+from sentiment import (  # noqa: E402
+    align_events_with_forward_returns,
+    build_session_sentiment_features,
+    load_bars,
+    load_combined_bars,
+    load_combined_sentiments,
+    load_sentiments,
+    session_label_R,
+    session_level_correlations,
+    validate_event_level,
+)
+
+
+def _event_level_for_split(
+    data_dir: Path,
+    sentiment_split: str,
+    bars_splits,
+    horizons,
+    n_boot: int,
+) -> pd.DataFrame:
+    sent = load_sentiments(data_dir, sentiment_split)
+    bars = (
+        load_combined_bars(data_dir, bars_splits)
+        if isinstance(bars_splits, (list, tuple))
+        else load_bars(data_dir, bars_splits)
+    )
+    events = align_events_with_forward_returns(sent, bars, horizons=horizons)
+    rep = validate_event_level(events, horizons=horizons, n_boot=n_boot)
+    rep.insert(0, "split", sentiment_split)
+    return rep
+
+
+def _fmt_report(df: pd.DataFrame) -> str:
+    show = df[
+        [
+            "split", "horizon", "n", "pearson", "pearson_ci_lo", "pearson_ci_hi",
+            "pearson_weighted", "spearman", "sign_hit_buy_sell", "sign_hit_score",
+            "mean_ret_diff", "pearson_high_conf", "pearson_low_conf",
+        ]
+    ].copy()
+    for c in show.columns:
+        if show[c].dtype.kind == "f":
+            show[c] = show[c].map(lambda v: f"{v:+.4f}" if pd.notna(v) else "  nan ")
+    return show.to_string(index=False)
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser(description="Validate sentiment scores against OHLC price movements.")
+    ap.add_argument("--data-dir", type=Path, default=None, help="Data folder (default: repo data/).")
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=_REPO_ROOT / "Submissions" / "sentiment_validation",
+        help="Directory to write per-split CSVs (default: Submissions/sentiment_validation).",
+    )
+    ap.add_argument(
+        "--horizons",
+        type=int,
+        nargs="+",
+        default=[1, 2, 3, 5, 10, 20],
+        help="Forward horizons to test (bars).",
+    )
+    ap.add_argument("--n-boot", type=int, default=200, help="Bootstrap resamples for CIs.")
+    ap.add_argument("--decay-half-life", type=float, default=10.0, help="Half-life for session decay weights.")
+    args = ap.parse_args()
+
+    data_dir = (args.data_dir or default_data_dir()).resolve()
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    reports = []
+
+    # Train sentiment events (both seen-half and unseen-half) paired against the
+    # full OHLC path (seen + unseen) - this is the only split where long
+    # horizons are informative.
+    reports.append(
+        _event_level_for_split(
+            data_dir,
+            "train_seen",
+            ["train_seen", "train_unseen"],
+            args.horizons,
+            args.n_boot,
+        )
+    )
+    reports.append(
+        _event_level_for_split(
+            data_dir,
+            "train_unseen",
+            ["train_seen", "train_unseen"],
+            args.horizons,
+            args.n_boot,
+        )
+    )
+    # Public / private test: only seen-half bars exist, so horizons beyond
+    # (49 - bar_ix) will be dropped by the aligner.
+    reports.append(
+        _event_level_for_split(
+            data_dir, "public_test", "public_test", args.horizons, args.n_boot
+        )
+    )
+    reports.append(
+        _event_level_for_split(
+            data_dir, "private_test", "private_test", args.horizons, args.n_boot
+        )
+    )
+
+    full_event = pd.concat(reports, ignore_index=True)
+    event_csv = out_dir / "event_level_report.csv"
+    full_event.to_csv(event_csv, index=False)
+
+    print("========== EVENT-LEVEL VALIDATION ==========")
+    print("(pearson_ci_lo / pearson_ci_hi are 95% bootstrap intervals)\n")
+    print(_fmt_report(full_event))
+    print(f"\n  -> wrote {event_csv}\n")
+
+    # Session-level (train only, since we need R)
+    seen = load_bars(data_dir, "train_seen")
+    unseen = load_bars(data_dir, "train_unseen")
+    R = session_label_R(seen, unseen)
+
+    # Seen-half sentiment aggregates (the ones the predictor can actually use)
+    sent_seen = load_sentiments(data_dir, "train_seen")
+    feats_seen = build_session_sentiment_features(
+        sent_seen, decision_bar=int(seen["bar_ix"].max()),
+        decay_half_life=args.decay_half_life,
+    )
+    session_rep_seen = session_level_correlations(feats_seen, R, n_boot=args.n_boot)
+    session_rep_seen.insert(0, "source", "train_seen_half")
+
+    # Unseen-half sentiment aggregates (for reference - cannot be used at
+    # inference time, but shows the ceiling of the signal).
+    sent_unseen = load_sentiments(data_dir, "train_unseen")
+    feats_unseen = build_session_sentiment_features(
+        sent_unseen,
+        decision_bar=int(unseen["bar_ix"].max()),
+        decay_half_life=args.decay_half_life,
+    )
+    session_rep_unseen = session_level_correlations(feats_unseen, R, n_boot=args.n_boot)
+    session_rep_unseen.insert(0, "source", "train_unseen_half")
+
+    session_report = pd.concat([session_rep_seen, session_rep_unseen], ignore_index=True)
+    sess_csv = out_dir / "session_level_report.csv"
+    session_report.to_csv(sess_csv, index=False)
+
+    print("========== SESSION-LEVEL VALIDATION (train) ==========")
+    print("Feature -> R = close_end/close_half - 1 (the competition label)\n")
+    out = session_report.copy()
+    for c in out.columns:
+        if out[c].dtype.kind == "f":
+            out[c] = out[c].map(lambda v: f"{v:+.4f}" if pd.notna(v) else "  nan ")
+    print(out.to_string(index=False))
+    print(f"\n  -> wrote {sess_csv}\n")
+
+
+if __name__ == "__main__":
+    main()

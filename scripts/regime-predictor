@@ -1,0 +1,195 @@
+#!/usr/bin/env python3
+"""Regime-pipeline predictor CLI.
+
+Implements the plan's HMM-based regime/process-library pipeline end-to-end:
+
+* Builds bar-level OHLC emission vectors for every session.
+* Fits a pooled Gaussian HMM (Method 1) with multi-start EM.
+* Selects the state count via BIC + session-level CV Sharpe.
+* Monte-Carlo forecasts each test session's second-half return distribution.
+* Tunes the Sharpe-aware sizer on OOF predictions.
+* Writes a timestamped submission into ``Submissions/``.
+
+Method 2 (model-based clustering with cluster-specific HMMs) is available via
+``--method m2``.
+
+Usage::
+
+    python scripts/regime-predictor                       # Method 1 baseline
+    python scripts/regime-predictor --method m1 --n-sim 1024
+    python scripts/regime-predictor --method m2 --n-clusters 3
+    python scripts/regime-predictor --use-news            # raises (not wired yet)
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_REGIME_DIR = _REPO_ROOT / "src" / "regime"
+for _p in (_REGIME_DIR,):
+    sp = str(_p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+from clustering import ClusteringConfig  # noqa: E402
+from emissions import EmissionConfig  # noqa: E402
+from forecast import MCConfig  # noqa: E402
+from hmm_model import HMMHyper  # noqa: E402
+from news import NewsConfig  # noqa: E402
+from paths import data_dir as default_data_dir, submissions_dir as default_sub_dir  # noqa: E402
+from pipeline import RegimeConfig, run_pipeline  # noqa: E402
+from selection import SelectionConfig, SelectionGrid  # noqa: E402
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="Regime pipeline predictor (HMM-based process library).",
+    )
+    p.add_argument("--data-dir", type=Path, default=None, help="Parquet folder (default: repo data/).")
+    p.add_argument(
+        "--submissions-dir",
+        type=Path,
+        default=None,
+        help="Output folder for the timestamped submission (default: repo Submissions/).",
+    )
+    p.add_argument("--method", choices=("m1", "m2"), default="m1", help="m1 = pooled HMM, m2 = clustered HMMs.")
+    p.add_argument("--seed", type=int, default=0, help="Random seed for HMM EM, CV and MC.")
+
+    # HMM hyperparameters
+    p.add_argument("--n-components", type=int, default=3, help="Default state count (overridden by selection for m1).")
+    p.add_argument("--covariance-type", default="diag", choices=("diag", "full", "spherical", "tied"))
+    p.add_argument("--n-iter", type=int, default=200, help="Baum-Welch iterations per EM run.")
+    p.add_argument("--n-starts", type=int, default=5, help="EM random restarts.")
+    p.add_argument("--min-covar", type=float, default=1e-4, help="Emission covariance floor.")
+
+    # Selection grid (m1)
+    p.add_argument(
+        "--select-states",
+        default="2,3,4",
+        help="Comma-separated state counts to grid-search in m1 selection (e.g. 2,3,4,5).",
+    )
+    p.add_argument(
+        "--select-cov-types",
+        default="diag",
+        help="Comma-separated covariance types to grid-search (subset of diag,full,spherical,tied).",
+    )
+    p.add_argument("--select-cv-splits", type=int, default=4, help="KFold count inside selection.")
+    p.add_argument("--select-starts", type=int, default=4, help="EM restarts per grid candidate.")
+    p.add_argument("--bic-tol", type=float, default=50.0, help="BIC tolerance for Level-1 eligibility.")
+
+    # Clustering (m2)
+    p.add_argument("--n-clusters", type=int, default=2, help="Cluster count for m2.")
+    p.add_argument("--cluster-max-iter", type=int, default=5, help="Reassign/refit rounds for m2.")
+    p.add_argument("--cluster-temperature", type=float, default=1.0, help="Softmax temperature for responsibilities.")
+
+    # MC forecasting
+    p.add_argument("--horizon", type=int, default=50, help="Forecast horizon in bars (default 50).")
+    p.add_argument("--n-sim", type=int, default=512, help="Monte-Carlo paths per session.")
+    p.add_argument("--no-emission-noise", action="store_true", help="Disable per-step emission sampling (deterministic continuation).")
+
+    # Sizing / CV
+    p.add_argument("--oof-splits", type=int, default=5, help="K for KFold used to produce OOF predictions.")
+    p.add_argument("--target-scale", type=float, default=1.0, help="Scale of the tanh output (Sharpe is scale-invariant).")
+    p.add_argument("--clip-quantile", type=float, default=0.999, help="Clip |target_position| at this quantile (1.0 disables).")
+
+    # News
+    p.add_argument("--use-news", action="store_true", help="Enable news-aware branch (currently raises NotImplementedError).")
+
+    # Diagnostics dumps
+    p.add_argument("--ranking-out", type=Path, default=None, help="Optional ranking frame dump path.")
+
+    return p.parse_args()
+
+
+def _parse_int_tuple(raw: str) -> tuple:
+    return tuple(int(x.strip()) for x in raw.split(",") if x.strip())
+
+
+def _parse_str_tuple(raw: str) -> tuple:
+    return tuple(x.strip() for x in raw.split(",") if x.strip())
+
+
+def main() -> None:
+    args = _parse_args()
+
+    data_dir = (args.data_dir or default_data_dir()).resolve()
+    if not data_dir.is_dir():
+        raise SystemExit(f"Data directory not found: {data_dir}")
+
+    submissions_dir = (args.submissions_dir or default_sub_dir()).resolve()
+    submissions_dir.mkdir(parents=True, exist_ok=True)
+
+    emission_cfg = EmissionConfig()
+    mc_cfg = MCConfig(
+        horizon=int(args.horizon),
+        n_sim=int(args.n_sim),
+        emission_noise=not args.no_emission_noise,
+        seed=int(args.seed),
+    )
+    hmm_hyper = HMMHyper(
+        n_components=int(args.n_components),
+        covariance_type=str(args.covariance_type),
+        n_iter=int(args.n_iter),
+        n_starts=int(args.n_starts),
+        min_covar=float(args.min_covar),
+        random_state=int(args.seed),
+    )
+    selection_cfg = SelectionConfig(
+        grid=SelectionGrid(
+            n_components=_parse_int_tuple(args.select_states),
+            covariance_types=_parse_str_tuple(args.select_cov_types),
+            n_starts=int(args.select_starts),
+        ),
+        cv_splits=int(args.select_cv_splits),
+        cv_random_state=int(args.seed),
+        bic_tol=float(args.bic_tol),
+    )
+    clustering_cfg = ClusteringConfig(
+        n_clusters=int(args.n_clusters),
+        max_iter=int(args.cluster_max_iter),
+        responsibility_temperature=float(args.cluster_temperature),
+        random_state=int(args.seed),
+    )
+    news_cfg = NewsConfig(enabled=bool(args.use_news))
+
+    cfg = RegimeConfig(
+        method=str(args.method),
+        random_state=int(args.seed),
+        emission=emission_cfg,
+        hmm=hmm_hyper,
+        selection=selection_cfg,
+        clustering=clustering_cfg,
+        mc=mc_cfg,
+        news=news_cfg,
+        oof_splits=int(args.oof_splits),
+        target_scale=float(args.target_scale),
+        clip_quantile=float(args.clip_quantile),
+    )
+
+    result = run_pipeline(data_dir, cfg)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    out_path = submissions_dir / f"regime_{cfg.method}_submission_{timestamp}.csv"
+    result.submission.to_csv(out_path, index=False)
+
+    print(f"Wrote {len(result.submission)} rows to {out_path}")
+    diag = dict(result.diagnostics)
+    diag["tuned_sizing"] = dataclasses.asdict(result.tuned_sizing)
+    print("Diagnostics:")
+    print(json.dumps(diag, indent=2, default=float))
+
+    if args.ranking_out is not None:
+        rp = Path(args.ranking_out)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        result.rankings.to_csv(rp, index=False)
+        print(f"Ranking dumped to {rp.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
