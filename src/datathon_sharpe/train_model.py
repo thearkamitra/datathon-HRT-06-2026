@@ -22,18 +22,26 @@ from datathon_sharpe.sentiment_features import (
     build_sharpe_session_features,
     load_sentiments_seen_test,
 )
+from datathon_sharpe.sharpe_label_transforms import SharpeOptimizerLabel, transform_r_for_optimizer
+from datathon_sharpe.distributional_mono import fit_distributional_mono
 from datathon_sharpe.training_table import load_training_feature_matrices
+from datathon_sharpe.ts_cnn import apply_cnn_r_pred_to_frame, train_cnn_predict_r
 
 
 def fit_full_train_and_submission(
     data_dir: Path,
     method: Method,
     *,
-    ridge_reg: float = 5.0,
-    l1_ratio: float = 0.15,
+    ridge_reg: float = 1.0,
+    l1_ratio: float = 0.0,
     random_state: int = 0,
     within_session_split: bool = False,
     augment_test_with_proxy: bool = True,
+    sharpe_optimizer_label: SharpeOptimizerLabel = "identity",
+    use_cnn: bool = False,
+    cnn_epochs: int = 40,
+    mse_anchor_lambda: float = 0.0,
+    distributional_policy: str = "prob_sign",
 ) -> tuple[pd.DataFrame, pd.DataFrame, TrainResult]:
     """
     Single fit on labeled rows; build test submission.
@@ -51,6 +59,21 @@ def fit_full_train_and_submission(
     Returns (train_predictions, submission, train_result).
     ``train_predictions`` is **train sessions only** (1000 rows) with competition ``R``,
     so session-level CV metrics stay comparable to the baseline.
+
+    ``sharpe_optimizer_label``: for ``sharpe_linear`` only, optionally replace ``R`` with
+    a transform (e.g. ``r2_sign_100`` for ``R**2 * 100 * sign(R)``) inside
+    ``_fit_linear_sharpe`` (Ridge warm-start + SLSQP). Reported train Sharpes still use
+    realized ``R`` from the data table.
+
+    ``use_cnn``: if True, train a small 1D CNN on OHLC sequences to predict ``R``, then set
+    ``cnn_r_pred`` for all sessions (train/test) before Sharpe-linear; stack optimizes jointly.
+
+    ``mse_anchor_lambda``: if > 0, Sharpe-linear minimizes
+    ``-Sharpe + λ·mean((w - w_ridge)²)`` with ``w = X_design β`` and ``w_ridge`` the Ridge
+    prediction of ``R`` (same warm-start). If 0, use unit-sphere Sharpe only (default).
+
+    ``distributional_policy``: for ``distributional_mono`` only — ``prob_sign``, ``quantile_median``,
+    or ``rank_score`` (see ``distributional_mono`` module).
     """
     feat_main, feat_fit = load_training_feature_matrices(
         data_dir,
@@ -70,13 +93,26 @@ def fit_full_train_and_submission(
 
     sen_te = load_sentiments_seen_test(data_dir)
 
+    cnn_scores: dict[int, float] | None = None
+    if use_cnn:
+        cnn_scores = train_cnn_predict_r(
+            data_dir,
+            feat_main,
+            epochs=cnn_epochs,
+            seed=random_state,
+        )
+        apply_cnn_r_pred_to_frame(feat_main, cnn_scores)
+        apply_cnn_r_pred_to_frame(feat_fit, cnn_scores)
+
     R_fit = feat_fit["R"].to_numpy(dtype=np.float64)
+    R_opt = transform_r_for_optimizer(R_fit, sharpe_optimizer_label)
     X_fit = feat_fit[FEATURE_COLUMNS_SHARPE].to_numpy(dtype=np.float64)
 
     model = None
     scaler_sharpe = None
     beta_sharpe = None
     opt_msg: str | None = None
+    dist_mono = None
     f_fit: np.ndarray
 
     if method == Method.constant:
@@ -95,15 +131,25 @@ def fit_full_train_and_submission(
     elif method == Method.sharpe_linear:
         scaler_sharpe, beta_sharpe, opt_msg = _fit_linear_sharpe(
             X_fit,
-            R_fit,
+            R_opt,
             random_state=random_state,
             ridge_alpha=ridge_reg,
             l1_ratio=l1_ratio,
+            mse_anchor_lambda=mse_anchor_lambda,
         )
         Xd_fit = np.column_stack(
             [np.ones(len(feat_fit), dtype=np.float64), scaler_sharpe.transform(X_fit)]
         )
         f_fit = Xd_fit @ beta_sharpe
+    elif method == Method.distributional_mono:
+        dist_mono = fit_distributional_mono(
+            X_fit,
+            R_fit,
+            policy=distributional_policy,
+            ridge_reg=ridge_reg,
+            random_state=random_state,
+        )
+        f_fit = dist_mono.predict_f(X_fit)
     else:
         raise ValueError(method)
 
@@ -130,6 +176,9 @@ def fit_full_train_and_submission(
             [np.ones(len(feat_main), dtype=np.float64), scaler_sharpe.transform(X_main)]
         )
         f_main = Xd_main @ beta_sharpe
+    elif method == Method.distributional_mono:
+        assert dist_mono is not None
+        f_main = dist_mono.predict_f(X_main)
     else:
         raise ValueError(method)
 
@@ -149,6 +198,8 @@ def fit_full_train_and_submission(
         sen_te,
         first_half=within_session_split,
     )
+    if use_cnn and cnn_scores is not None:
+        apply_cnn_r_pred_to_frame(feat_te_pred, cnn_scores)
     X_test = feat_te_pred[FEATURE_COLUMNS_SHARPE].to_numpy(dtype=np.float64)
 
     if method == Method.constant:
@@ -161,6 +212,9 @@ def fit_full_train_and_submission(
             [np.ones(len(feat_te_pred), dtype=np.float64), scaler_sharpe.transform(X_test)]
         )
         f_te = Xd_te @ beta_sharpe
+    elif method == Method.distributional_mono:
+        assert dist_mono is not None
+        f_te = dist_mono.predict_f(X_test)
     else:
         assert model is not None
         f_te = model.predict(X_test)
@@ -172,9 +226,15 @@ def fit_full_train_and_submission(
     result = TrainResult(
         method=method,
         train_sharpe=float(train_sh),
-        ridge_alpha=ridge_reg if method in (Method.ridge, Method.sharpe_linear) else None,
+        ridge_alpha=ridge_reg
+        if method in (Method.ridge, Method.sharpe_linear, Method.distributional_mono)
+        else None,
         sharpe_opt_message=opt_msg if method == Method.sharpe_linear else None,
         l1_ratio=l1_ratio if method == Method.sharpe_linear else None,
+        mse_anchor_lambda=mse_anchor_lambda if method == Method.sharpe_linear else None,
+        distributional_policy=(
+            distributional_policy if method == Method.distributional_mono else None
+        ),
     )
     return train_pred, sub, result
 
@@ -183,11 +243,16 @@ def fit_full_train_predictions(
     data_dir: Path,
     method: Method,
     *,
-    ridge_reg: float = 5.0,
-    l1_ratio: float = 0.15,
+    ridge_reg: float = 1.0,
+    l1_ratio: float = 0.0,
     random_state: int = 0,
     within_session_split: bool = False,
     augment_test_with_proxy: bool = True,
+    sharpe_optimizer_label: SharpeOptimizerLabel = "identity",
+    use_cnn: bool = False,
+    cnn_epochs: int = 40,
+    mse_anchor_lambda: float = 0.0,
+    distributional_policy: str = "prob_sign",
 ) -> pd.DataFrame:
     """Train-only table (session, R, f, w) for **train sessions**; same flags as ``fit_full_train_and_submission``."""
     train_pred, _, _ = fit_full_train_and_submission(
@@ -198,5 +263,10 @@ def fit_full_train_predictions(
         random_state=random_state,
         within_session_split=within_session_split,
         augment_test_with_proxy=augment_test_with_proxy,
+        sharpe_optimizer_label=sharpe_optimizer_label,
+        use_cnn=use_cnn,
+        cnn_epochs=cnn_epochs,
+        mse_anchor_lambda=mse_anchor_lambda,
+        distributional_policy=distributional_policy,
     )
     return train_pred

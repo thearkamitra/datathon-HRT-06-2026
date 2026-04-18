@@ -33,13 +33,13 @@ def main() -> None:
     p.add_argument(
         "--ridge-alpha",
         type=float,
-        default=5.0,
+        default=1.0,
         help="Ridge / ElasticNet alpha: --method ridge; Sharpe-linear warm-start.",
     )
     p.add_argument(
         "--l1-ratio",
         type=float,
-        default=0.15,
+        default=0.0,
         help="Sharpe-linear warm-start: ElasticNet l1_ratio (0=Ridge-only). Ignored for ridge.",
     )
     p.add_argument(
@@ -47,6 +47,13 @@ def main() -> None:
         type=int,
         default=0,
         help="Random seed (Ridge, Sharpe-linear init if needed).",
+    )
+    p.add_argument(
+        "--distributional-policy",
+        type=str,
+        choices=["prob_sign", "quantile_median", "rank_score"],
+        default="prob_sign",
+        help="For --method distributional_mono: target + monotone map (default prob_sign).",
     )
     p.add_argument(
         "-o",
@@ -71,6 +78,7 @@ def main() -> None:
         ridge_reg=args.ridge_alpha,
         random_state=args.seed,
         l1_ratio=args.l1_ratio,
+        distributional_policy=args.distributional_policy,
     )
 
     args.output.parent.mkdir(parents=True, exist_ok=True)
@@ -84,6 +92,8 @@ def main() -> None:
         print(f"L1 ratio (warm-start): {res.l1_ratio}")
     if res.sharpe_opt_message:
         print(f"Sharpe optimizer: {res.sharpe_opt_message}")
+    if res.distributional_policy:
+        print(f"Distributional policy: {res.distributional_policy}")
     print(f"Wrote {len(sub)} rows to {args.output.resolve()}")
 
 

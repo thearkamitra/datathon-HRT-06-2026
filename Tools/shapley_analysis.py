@@ -37,7 +37,8 @@ from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
 from datathon_baseline.predict import Method, _fit_linear_sharpe
-from datathon_sharpe.path_features import FEATURE_COLUMNS_SHARPE
+from datathon_sharpe.distributional_mono import fit_distributional_mono, shap_linear_parts
+from datathon_sharpe.sentiment_features import FEATURE_COLUMNS_SHARPE
 from datathon_sharpe.training_table import load_training_feature_matrices
 
 
@@ -56,6 +57,8 @@ def analyze(
     random_state: int,
     within_session_split: bool,
     augment_test_with_proxy: bool,
+    mse_anchor_lambda: float = 0.0,
+    distributional_policy: str = "prob_sign",
 ) -> tuple[pd.DataFrame, dict]:
     _, feat_fit = load_training_feature_matrices(
         data_dir,
@@ -75,10 +78,12 @@ def analyze(
             random_state=random_state,
             ridge_alpha=ridge_alpha,
             l1_ratio=l1_ratio,
+            mse_anchor_lambda=mse_anchor_lambda,
         )
         meta["sharpe_opt_message"] = msg
         meta["ridge_alpha_warmstart"] = ridge_alpha
         meta["l1_ratio_warmstart"] = l1_ratio
+        meta["mse_anchor_lambda"] = mse_anchor_lambda
         Xs = scaler.transform(X_raw)
         coef = beta[1:].astype(np.float64)
         phi = _shap_linear_scaled(Xs, coef)
@@ -107,6 +112,23 @@ def analyze(
     elif method == Method.constant:
         phi = np.zeros((n, len(FEATURE_COLUMNS_SHARPE)), dtype=np.float64)
         meta["note"] = "Constant signal: zero SHAP by construction."
+    elif method == Method.distributional_mono:
+        dist = fit_distributional_mono(
+            X_raw,
+            R,
+            policy=distributional_policy,
+            ridge_reg=ridge_alpha,
+            random_state=random_state,
+        )
+        meta["distributional_policy"] = distributional_policy
+        meta["ridge_alpha"] = ridge_alpha
+        Xs, coef = shap_linear_parts(dist, X_raw)
+        phi = _shap_linear_scaled(Xs, coef)
+        if dist.policy == "prob_sign":
+            meta["note"] = (
+                "Linear SHAP on logit margin (logistic coef × scaled features); "
+                "not full Kernel SHAP for probability."
+            )
     else:
         raise ValueError(method)
 
@@ -135,13 +157,13 @@ def main() -> None:
     p.add_argument(
         "--ridge-alpha",
         type=float,
-        default=5.0,
+        default=1.0,
         help="Ridge / ElasticNet alpha; Sharpe-linear warm-start (default 5).",
     )
     p.add_argument(
         "--l1-ratio",
         type=float,
-        default=0.15,
+        default=0.0,
         help="Sharpe-linear warm-start ElasticNet l1_ratio (0=Ridge-only).",
     )
     p.add_argument("--seed", type=int, default=0)
@@ -151,6 +173,19 @@ def main() -> None:
         action=argparse.BooleanOptionalAction,
         default=True,
         help="Include test sessions with proxy R in fit matrix (default: on).",
+    )
+    p.add_argument(
+        "--mse-anchor-lambda",
+        type=float,
+        default=0.0,
+        help="Sharpe-linear: λ for MSE anchor to Ridge w (0 = unit-sphere Sharpe).",
+    )
+    p.add_argument(
+        "--distributional-policy",
+        type=str,
+        choices=["prob_sign", "quantile_median", "rank_score"],
+        default="prob_sign",
+        help="distributional_mono: which fitted head to explain.",
     )
     p.add_argument(
         "-o",
@@ -173,6 +208,8 @@ def main() -> None:
         )
     if not 0.0 <= args.l1_ratio <= 1.0:
         raise SystemExit("--l1-ratio must be between 0 and 1.")
+    if args.mse_anchor_lambda < 0.0:
+        raise SystemExit("--mse-anchor-lambda must be non-negative.")
 
     method = Method(args.method)
     out = args.output or (
@@ -188,6 +225,8 @@ def main() -> None:
         random_state=args.seed,
         within_session_split=args.within_session_split,
         augment_test_with_proxy=args.augment_test_proxy,
+        mse_anchor_lambda=args.mse_anchor_lambda,
+        distributional_policy=args.distributional_policy,
     )
 
     summary.to_csv(out, index=False)

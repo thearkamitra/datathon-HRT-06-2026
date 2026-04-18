@@ -26,6 +26,11 @@ from datathon_sharpe.split import (
     split_25_25,
     train_session_pool,
 )
+from datathon_sharpe.sharpe_label_transforms import (
+    SharpeOptimizerLabel,
+    r_squared_times_100_signed,
+    transform_r_for_optimizer,
+)
 from datathon_sharpe.train_model import fit_full_train_and_submission, fit_full_train_predictions
 
 __all__ = [
@@ -42,11 +47,14 @@ __all__ = [
     "fit_full_train_predictions",
     "load_training_feature_matrices",
     "merge_public_private_test_sessions",
+    "r_squared_times_100_signed",
     "run_cv_report",
+    "SharpeOptimizerLabel",
     "sessions_from_bars_csv",
     "split_25_25",
     "split_test_csv_sessions_25_25",
     "proxy_returns_second_seen_half_from_bars",
     "train_proxy_returns_second_seen_half",
     "train_session_pool",
+    "transform_r_for_optimizer",
 ]
