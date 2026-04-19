@@ -63,7 +63,10 @@ graph TD
 
 ---
 
-## 🧠 Modeling Methods
+## Modeling Methods
+
+> [!TIP]
+> **Exploration First:** It is highly recommended to use the [Data Visualization & Exploration](#-data-visualization--exploration) tools to understand session-level dynamics and feature-label correlations *before* fitting complex models. This ensures your feature selection is grounded in empirical data.
 
 ### 1. Sharpe-Linear Ensemble (Main)
 The primary strategy uses linear models for their robustness in high-noise environments.
@@ -171,6 +174,32 @@ If you need to re-process raw headlines or update sector mappings:
    ```bash
    uv run python scripts/update_sectors.py --files data/sentiments_*.csv --provider gemini
    ```
+
+---
+
+## 🏁 Final Notes
+
+## 📊 Data Visualization & Exploration
+
+We provide an interactive dashboard to explore the relationship between market OHLC data, headlines, and future returns.
+
+### 1. Interactive Dashboard (Streamlit)
+The dashboard allows you to visualize individual sessions, inspect candlestick charts with overlaid news events, and analyze cross-correlations between "seen" features and "unseen" labels.
+
+**To run the dashboard:**
+```bash
+uv run streamlit run Data_Dashboard/app.py
+```
+
+**Key Features:**
+- **Session Explorer:** View interactive candlestick charts for any session ID. Headlines are marked with orange diamonds; hovering reveals the text.
+- **Dataset Overview:** Analyze the distribution of returns and headline counts across Train, Public Test, and Private Test sets.
+- **Correlation Matrix:** (Train only) Explore which technical features (volatility, momentum, range) have the highest linear or monotonic correlation with the target return $R$.
+
+### 2. Manual Data Exploration
+For quick command-line inspection of the raw Parquet files:
+- **`scripts/parquet_to_readable_text.py`**: Converts binary Parquet data into human-readable text for quick grepping.
+- **`research/explore_headlines.ipynb`**: A Jupyter notebook for deep-diving into the headline distributions and sector frequencies.
 
 ---
 
