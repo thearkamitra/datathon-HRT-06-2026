@@ -1,0 +1,386 @@
+#!/usr/bin/env python3
+"""Apples-to-apples benchmark of tailored-modeler variants.
+
+Runs every variant under one frozen validation protocol:
+  * Same 5-fold KFold(seed=0, shuffle=True) for OOF predictions.
+  * Same flat-long baseline used as the reference in all paired tests.
+  * Per-head OOF Sharpes reported for the 3-head variants.
+  * Paired t-statistic of per-fold Sharpe improvement vs flat-long.
+
+Variants covered (matches the reviewer's requested benchmark table):
+
+  1. flat_long                                   Reference: all +1.
+  2. linear_ohlc_only                            Ridge on 8 OHLC-only features
+                                                 (matches existing `ridge` baseline
+                                                 *without* headline_count).
+  3. linear_ohlc_plus_headline_count             Ridge on 9 features incl.
+                                                 headline_count (matches the
+                                                 baseline scoring ~2.337).
+  4. linear_in_tailored                          Ridge on the full tailored 73-OHLC
+                                                 feature set (low-variance anchor).
+  5. tailored_lite_ohlc                          3-head LightGBM on the baseline's
+                                                 8 OHLC features only.
+  6. tailored_full_ohlc                          3-head LightGBM on full 73-feature
+                                                 OHLC feature set (OHLC-only).
+  7. tailored_full_ohlc + sentiment              6. plus seen-half sentiment news
+                                                 features (NewsConfig.enabled=True).
+  8. head ablations (on variant 6):              mean-only / mean+sign / mean+quantile
+                                                 / full-stack sizings.
+
+All variants use the *same* KFold groups so the paired t-tests are valid.
+
+Usage::
+
+    python scripts/benchmark-tailored
+    python scripts/benchmark-tailored --out-dir reports/benchmarks
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Callable, Dict, List, Optional, Tuple
+
+import numpy as np
+import pandas as pd
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_TM_DIR = _REPO_ROOT / "src" / "tailored-modeler"
+for _p in (_TM_DIR,):
+    sp = str(_p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+from sklearn.linear_model import Ridge  # noqa: E402
+from sklearn.model_selection import KFold  # noqa: E402
+from sklearn.preprocessing import StandardScaler  # noqa: E402
+
+from features import build_session_features, feature_columns  # noqa: E402
+from labels import train_realized_returns  # noqa: E402
+from models import BoosterHyper, SampleWeightConfig, TabularHeads  # noqa: E402
+from news import NewsConfig, build_news_features  # noqa: E402
+from paths import BARS_SEEN_TRAIN, data_dir as default_data_dir  # noqa: E402
+from sizing import apply_sizing, SizingConfig, sharpe, tune_sizing  # noqa: E402
+
+
+# ---------- Small stats helpers ----------------------------------------------
+
+
+def fold_sharpes(pos: np.ndarray, y: np.ndarray, fold: np.ndarray) -> np.ndarray:
+    out = []
+    for k in sorted(np.unique(fold)):
+        m = fold == k
+        out.append(sharpe(pos[m] * y[m]))
+    return np.asarray(out, dtype=np.float64)
+
+
+def paired_t(diffs: np.ndarray) -> float:
+    d = diffs[np.isfinite(diffs)]
+    if d.size < 2:
+        return 0.0
+    m, s = float(np.mean(d)), float(np.std(d, ddof=1))
+    return m / (s / np.sqrt(d.size)) if s > 1e-12 else (np.sign(m) * 1e6 if m else 0.0)
+
+
+# ---------- Baselines --------------------------------------------------------
+
+
+def _baseline_ohlc_columns(feats: pd.DataFrame) -> List[str]:
+    return [
+        c
+        for c in (
+            "open_first",
+            "close_last",
+            "cum_ret",
+            "vol",
+            "range_hl",
+            "max_high",
+            "min_low",
+            "mean_bar_ret",
+        )
+        if c in feats.columns
+    ]
+
+
+def _ridge_oof(
+    X: np.ndarray, y: np.ndarray, fold: np.ndarray, alpha: float = 1.0
+) -> np.ndarray:
+    preds = np.zeros_like(y, dtype=np.float64)
+    for k in sorted(np.unique(fold)):
+        tr = fold != k
+        va = fold == k
+        model = Ridge(alpha=alpha, random_state=0)
+        scaler = StandardScaler()
+        Xtr = scaler.fit_transform(X[tr])
+        Xva = scaler.transform(X[va])
+        model.fit(Xtr, y[tr])
+        preds[va] = model.predict(Xva)
+    return preds
+
+
+# ---------- Variant definitions ---------------------------------------------
+
+
+@dataclass
+class VariantResult:
+    name: str
+    fold_sharpes: np.ndarray
+    mean_sharpe: float
+    std_sharpe: float
+    t_vs_flat: float
+    extra: Dict[str, float]
+
+
+def _tailored_variant(
+    name: str,
+    X: pd.DataFrame,
+    y: np.ndarray,
+    fold: np.ndarray,
+    use_news_cols: List[str],
+    *,
+    sizing_mode: str = "auto",
+    head_ablation: Optional[str] = None,
+    hyper: Optional[BoosterHyper] = None,
+) -> Tuple[VariantResult, pd.DataFrame]:
+    """Run a 3-head booster variant, return (result, oof_preds).
+
+    ``head_ablation`` (None, 'mean_only', 'mean_sign', 'mean_quantile') controls
+    which heads feed the sizing layer. When None, the full sizer is used.
+    """
+    hyper = hyper or BoosterHyper()
+    heads_proto = TabularHeads(
+        random_state=0,
+        hyper=hyper,
+        sample_weights=SampleWeightConfig(enabled=True),
+    )
+    feat_cols = list(X.columns) + list(use_news_cols)  # already merged in X
+    # The caller should already have merged the news columns into X.
+    preds = heads_proto.cross_val_predict(X, y, n_splits=5, n_repeats=1)
+
+    mu = preds["mu"].to_numpy(np.float64)
+    p_up = preds["p_up"].to_numpy(np.float64)
+    u = preds["u"].to_numpy(np.float64)
+
+    if head_ablation == "mean_only":
+        # Treat mu directly as the raw position, scaled to unit median |pos|.
+        scale = float(np.median(np.abs(mu))) or 1.0
+        pos = mu / scale
+        chosen_cfg = {"mode": "mu_only_scaled", "scale": scale}
+    elif head_ablation == "mean_sign":
+        pos = np.sign(mu) * np.where(p_up > 0.5, 1.0, -1.0)
+        chosen_cfg = {"mode": "sign_of_mean_and_sign"}
+    elif head_ablation == "mean_quantile":
+        pos = mu / np.maximum(u, 1e-4) ** 2
+        scale = float(np.median(np.abs(pos))) or 1.0
+        pos = pos / scale
+        chosen_cfg = {"mode": "kelly_mu_over_u2", "scale": scale}
+    else:
+        # Full Stage-7 sizer with OOF argmax on current fold groups.
+        tuned_cfg, tune_info = tune_sizing(preds, y, fold_groups=fold)
+        pos, _ = apply_sizing(preds, tuned_cfg)
+        chosen_cfg = {
+            "mode": tuned_cfg.mode,
+            "alpha": tuned_cfg.alpha,
+            "lam": tuned_cfg.lam,
+            "tau_quantile": tuned_cfg.tau_quantile,
+            "oof_sharpe": tune_info.get("oof_sharpe", float("nan")),
+        }
+
+    fs = fold_sharpes(pos, y, fold)
+    flat_fs = fold_sharpes(np.ones_like(y), y, fold)
+    t = paired_t(fs - flat_fs)
+
+    extra: Dict[str, float] = {
+        "sizer": chosen_cfg,  # type: ignore[assignment]
+        "oof_sharpe_sign_p": sharpe(np.where(p_up > 0.5, 1.0, -1.0) * y),
+        "oof_sharpe_sign_mu": sharpe(np.sign(mu) * y),
+    }
+
+    return (
+        VariantResult(
+            name=name,
+            fold_sharpes=fs,
+            mean_sharpe=float(np.mean(fs)),
+            std_sharpe=float(np.std(fs, ddof=0)),
+            t_vs_flat=t,
+            extra=extra,
+        ),
+        preds,
+    )
+
+
+def _linear_variant(
+    name: str, X: np.ndarray, y: np.ndarray, fold: np.ndarray, alpha: float = 1.0
+) -> VariantResult:
+    """Predict R via Ridge OOF, use the prediction directly as target_position
+    (with the sign-correction the ``datathon_baseline`` uses: if the inner
+    product with R is negative, flip it). Scale to unit median |pos|.
+    """
+    oof = _ridge_oof(X, y, fold, alpha=alpha)
+    # sign correction (matches datathon_baseline.predict logic)
+    if float(np.mean(oof * y)) < 0:
+        oof = -oof
+    scale = float(np.median(np.abs(oof))) or 1.0
+    pos = oof / scale
+    fs = fold_sharpes(pos, y, fold)
+    flat_fs = fold_sharpes(np.ones_like(y), y, fold)
+    t = paired_t(fs - flat_fs)
+    return VariantResult(
+        name=name,
+        fold_sharpes=fs,
+        mean_sharpe=float(np.mean(fs)),
+        std_sharpe=float(np.std(fs, ddof=0)),
+        t_vs_flat=t,
+        extra={"sizer": {"mode": "ridge_pos_scaled", "alpha": alpha}},
+    )
+
+
+# ---------- Main benchmark ---------------------------------------------------
+
+
+def main() -> None:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--data-dir", type=Path, default=None)
+    ap.add_argument(
+        "--out-dir",
+        type=Path,
+        default=_REPO_ROOT / "Submissions" / "benchmarks",
+    )
+    args = ap.parse_args()
+
+    data_dir = (args.data_dir or default_data_dir()).resolve()
+    out_dir = args.out_dir.resolve()
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    # 1. Build once: OHLC features + labels + news features + fold groups.
+    bars = pd.read_parquet(data_dir / BARS_SEEN_TRAIN)
+    feats = build_session_features(bars)
+    labels = train_realized_returns(data_dir)
+    feats = feats.merge(labels[["session", "R"]], on="session", how="inner")
+    feats = feats.sort_values("session").reset_index(drop=True)
+
+    y = feats["R"].to_numpy(dtype=np.float64)
+
+    news_cfg = NewsConfig(enabled=True)
+    news_feats = build_news_features(
+        feats["session"], news_cfg, data_dir=data_dir, splits=("train_seen",),
+    )
+    feats_with_news = feats.merge(news_feats, on="session", how="left").fillna(0.0)
+
+    full_ohlc_cols = feature_columns(feats)  # 73 cols
+    base_ohlc_cols = _baseline_ohlc_columns(feats)  # 8 cols
+    headline_count_col = ["headline_count"] if "headline_count" in feats.columns else []
+    news_cols = [c for c in news_feats.columns if c != "session"]
+
+    # Frozen fold groups for paired tests across every variant.
+    kf = KFold(n_splits=5, shuffle=True, random_state=0)
+    fold = np.zeros(len(feats), dtype=np.int64)
+    for k, (_, va) in enumerate(kf.split(feats)):
+        fold[va] = k
+
+    flat_fs = fold_sharpes(np.ones_like(y), y, fold)
+    variants: List[VariantResult] = []
+
+    variants.append(
+        VariantResult(
+            name="flat_long",
+            fold_sharpes=flat_fs,
+            mean_sharpe=float(np.mean(flat_fs)),
+            std_sharpe=float(np.std(flat_fs, ddof=0)),
+            t_vs_flat=0.0,
+            extra={},
+        )
+    )
+
+    # Linear baselines (headline_count IN vs OUT).
+    lin_in = feats[base_ohlc_cols].to_numpy(dtype=np.float64)
+    variants.append(_linear_variant("linear_ohlc_only", lin_in, y, fold))
+    if headline_count_col:
+        variants.append(
+            _linear_variant(
+                "linear_ohlc_plus_headline_count",
+                feats[base_ohlc_cols + headline_count_col].to_numpy(dtype=np.float64),
+                y,
+                fold,
+            )
+        )
+
+    # Linear on full tailored 73-feature set.
+    variants.append(
+        _linear_variant(
+            "linear_in_tailored_73feats",
+            feats[full_ohlc_cols].to_numpy(dtype=np.float64),
+            y,
+            fold,
+            alpha=5.0,
+        )
+    )
+
+    # Tailored-lite: 3-head booster on just the 8 baseline OHLC columns.
+    tailored_lite_X = feats[base_ohlc_cols]
+    res, _ = _tailored_variant("tailored_lite_ohlc_8feats", tailored_lite_X, y, fold, [])
+    variants.append(res)
+
+    # Tailored full OHLC (the current production pipeline, OHLC-only).
+    tailored_full_X = feats[full_ohlc_cols]
+    res_full, preds_full = _tailored_variant(
+        "tailored_full_ohlc", tailored_full_X, y, fold, []
+    )
+    variants.append(res_full)
+
+    # Head ablations of the full-OHLC variant.
+    for abl in ("mean_only", "mean_sign", "mean_quantile"):
+        res_abl, _ = _tailored_variant(
+            f"tailored_full_ohlc.{abl}", tailored_full_X, y, fold, [],
+            head_ablation=abl,
+        )
+        variants.append(res_abl)
+
+    # Tailored full OHLC + seen-half sentiment.
+    tailored_news_X = feats_with_news[full_ohlc_cols + news_cols]
+    res_news, _ = _tailored_variant(
+        "tailored_full_ohlc_plus_sentiment", tailored_news_X, y, fold, news_cols,
+    )
+    variants.append(res_news)
+
+    # ---------- Report ----------
+    table_rows = []
+    for v in variants:
+        table_rows.append(
+            {
+                "variant": v.name,
+                "mean_sharpe": round(v.mean_sharpe, 4),
+                "std_sharpe": round(v.std_sharpe, 4),
+                "t_vs_flat": round(v.t_vs_flat, 2),
+                "fold_sharpes": [round(float(x), 3) for x in v.fold_sharpes],
+            }
+        )
+    tbl = pd.DataFrame(table_rows)
+    tbl = tbl.sort_values("mean_sharpe", ascending=False).reset_index(drop=True)
+
+    out_csv = out_dir / "benchmark_table.csv"
+    tbl.to_csv(out_csv, index=False)
+
+    print("========== BENCHMARK TABLE (one OOF-CV protocol, KFold seed=0) ==========\n")
+    pd.set_option("display.width", 200)
+    pd.set_option("display.max_colwidth", 100)
+    print(tbl.to_string(index=False))
+    print(f"\n  -> wrote {out_csv}\n")
+
+    # Also dump per-variant sizer configs as JSON for reproducibility.
+    sizers = {v.name: v.extra.get("sizer") for v in variants if v.extra}
+    with (out_dir / "benchmark_sizers.json").open("w") as f:
+        json.dump(sizers, f, indent=2, default=str)
+
+    print("Feature counts:")
+    print(f"  base 8-OHLC    : {len(base_ohlc_cols)} cols")
+    print(f"  full tailored  : {len(full_ohlc_cols)} cols")
+    print(f"  sentiment cols : {len(news_cols)} cols "
+          f"(news: seen_half only)\n")
+
+
+if __name__ == "__main__":
+    main()

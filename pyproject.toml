@@ -5,21 +5,29 @@ description = "Financial portfolio decision making based on headline sentiment"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
-    "pandas",
-    "pyarrow",
+    # core data
+    "numpy==1.26.4",
+    "pandas==2.2.3",
+    "pyarrow==19.0.0",
+    "scipy==1.15.1",
+    # ML
+    "scikit-learn==1.6.1",
+    "xgboost==3.2.0",
+    "lightgbm==4.6.0",
+    "hmmlearn==0.3.3",
+    # utilities
+    "tqdm==4.67.1",
+    "python-dotenv==1.0.1",
+    "requests==2.32.3",
+    "joblib==1.4.2",
+    # visualisation / dashboard
+    "matplotlib==3.10.0",
+    "plotly==5.24.1",
+    "streamlit==1.41.1",
+    # LLM / NLP (optional — comment out if not using headline pipeline)
     "google-genai",
-    "numpy",
-    "python-dotenv",
-    "requests",
-    "tqdm",
-    "scikit-learn>=1.6.1",
-    "matplotlib>=3.9.4",
     "transformers>=4.57.6",
     "torch>=2.8.0",
-    "scipy>=1.10",
-    "streamlit>=1.32",
-    "plotly>=5.18",
-    "kaleido>=0.2",
 ]
 
 [project.scripts]

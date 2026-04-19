@@ -9,7 +9,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.optimize import minimize
-from sklearn.linear_model import Ridge
+from sklearn.linear_model import ElasticNet, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
@@ -29,6 +29,7 @@ class Method(str, Enum):
     ridge = "ridge"
     momentum = "momentum"
     constant = "constant"
+    distributional_mono = "distributional_mono"
 
 
 @dataclass
@@ -37,6 +38,9 @@ class TrainResult:
     train_sharpe: float
     ridge_alpha: float | None
     sharpe_opt_message: str | None = None
+    l1_ratio: float | None = None
+    mse_anchor_lambda: float | None = None
+    distributional_policy: str | None = None
 
 
 def _fit_linear_sharpe(
@@ -44,10 +48,22 @@ def _fit_linear_sharpe(
     R: np.ndarray,
     *,
     random_state: int,
+    ridge_alpha: float = 1.0,
+    l1_ratio: float = 0.0,
+    mse_anchor_lambda: float = 0.0,
 ) -> tuple[StandardScaler, np.ndarray, str]:
     """
     Maximize train Sharpe with w_i = (X_design @ beta)_i, X_design = [1 | X_scaled],
     subject to ||beta||_2 = 1 (otherwise Sharpe is scale-invariant along rays).
+
+    Optional extensions used by the `datathon_sharpe` stack:
+
+    - `ridge_alpha`: regularization strength for the warm-start linear model.
+    - `l1_ratio`: when > 0, use ElasticNet instead of Ridge for the warm start.
+      The final optimizer is still Sharpe-driven; this only shapes the initial
+      direction and the optional MSE anchor.
+    - `mse_anchor_lambda`: if > 0, add an MSE penalty that keeps the optimized
+      positions near the warm-start model predictions.
     """
     rng = np.random.default_rng(random_state)
     scaler = StandardScaler()
@@ -55,19 +71,40 @@ def _fit_linear_sharpe(
     n, d = Xs.shape
     Xd = np.column_stack([np.ones(n, dtype=np.float64), Xs])
 
-    ridge = Ridge(alpha=1.0, random_state=random_state)
-    ridge.fit(Xs, R)
-    beta0 = np.concatenate([[ridge.intercept_], ridge.coef_])
+    l1_ratio = float(np.clip(l1_ratio, 0.0, 1.0))
+    ridge_alpha = float(max(ridge_alpha, 0.0))
+    mse_anchor_lambda = float(max(mse_anchor_lambda, 0.0))
+
+    if l1_ratio > 0.0:
+        warm_model = ElasticNet(
+            alpha=max(ridge_alpha, 1e-6),
+            l1_ratio=l1_ratio,
+            fit_intercept=True,
+            max_iter=20000,
+            random_state=random_state,
+        )
+    else:
+        warm_model = Ridge(alpha=ridge_alpha, random_state=random_state)
+    warm_model.fit(Xs, R)
+
+    beta0 = np.concatenate([[warm_model.intercept_], warm_model.coef_])
+    w_anchor = np.asarray(warm_model.predict(Xs), dtype=np.float64)
     nrm = float(np.linalg.norm(beta0))
     if nrm < 1e-12:
         beta0 = rng.standard_normal(d + 1)
         nrm = float(np.linalg.norm(beta0))
     beta0 = beta0 / nrm
 
+    def _objective(beta: np.ndarray) -> float:
+        loss = float(neg_sharpe_linear(beta, Xd, R))
+        if mse_anchor_lambda > 0.0:
+            w = Xd @ beta
+            loss += mse_anchor_lambda * float(np.mean((w - w_anchor) ** 2))
+        return loss
+
     res = minimize(
-        neg_sharpe_linear,
+        _objective,
         beta0,
-        args=(Xd, R),
         method="SLSQP",
         constraints={"type": "eq", "fun": lambda b: float(np.dot(b, b) - 1.0)},
         options={"maxiter": 2000, "ftol": 1e-10},

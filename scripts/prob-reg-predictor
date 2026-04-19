@@ -1,0 +1,215 @@
+#!/usr/bin/env python3
+"""Probabilistic-regression predictor CLI.
+
+Implements the plan in ``plans/probablisticReg.txt``: linear conditional
+mean + linear conditional variance (heteroskedastic ridge regression) on
+top of OHLC session features *and* a news block acting as session identity
+(top-K entity footprint, TF-IDF + SVD topic fingerprint, decay-weighted
+sentiment aggregates).
+
+The script:
+
+1.  Builds the design matrix (OHLC features + news-identity block).
+2.  Runs the two-pass heteroskedastic OOF protocol (mean head on pass 1,
+    variance head on OOF squared residuals on pass 2).
+3.  Projects ``(mu, sigma)`` into the ``(mu, p_up, q10/q50/q90, u)``
+    contract consumed by the shared Sharpe-aware sizer and grid-tunes the
+    sizer against the competition Sharpe on the OOF predictions.
+4.  Refits both heads on the full train set with honest OOF variance
+    targets, predicts the 20000 test sessions, applies the tuned sizer,
+    and writes a timestamped submission under ``Submissions/``.
+
+Usage::
+
+    python scripts/prob-reg-predictor                         # default (news ON)
+    python scripts/prob-reg-predictor --no-news               # OHLC-only ablation
+    python scripts/prob-reg-predictor --mean-model elastic_net
+    python scripts/prob-reg-predictor --empirical-quantiles   # use QuantileReg q* instead of Gaussian
+"""
+
+from __future__ import annotations
+
+import argparse
+import dataclasses
+import json
+import sys
+from datetime import datetime
+from pathlib import Path
+
+_REPO_ROOT = Path(__file__).resolve().parent.parent
+_PR_DIR = _REPO_ROOT / "src" / "prob-reg"
+for _p in (_PR_DIR,):
+    sp = str(_p)
+    if sp not in sys.path:
+        sys.path.insert(0, sp)
+
+from heads import HeadsConfig  # noqa: E402
+from paths import data_dir as default_data_dir, submissions_dir as default_sub_dir  # noqa: E402
+from pipeline import NewsConfig, ProbRegConfig, run_pipeline  # noqa: E402
+from pipeline import SizingConfig  # noqa: E402
+
+
+def _parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description=(
+            "Probabilistic-regression predictor "
+            "(heteroskedastic linear mean + variance heads with Sharpe-aware sizer)."
+        )
+    )
+    p.add_argument("--data-dir", type=Path, default=None, help="Parquet folder (default: repo data/).")
+    p.add_argument(
+        "--submissions-dir",
+        type=Path,
+        default=None,
+        help="Output folder for the timestamped submission (default: repo Submissions/).",
+    )
+    p.add_argument("--seed", type=int, default=0, help="Random seed for CV and regressors.")
+    p.add_argument("--cv-splits", type=int, default=5, help="KFold splits for the two-pass OOF protocol.")
+    p.add_argument(
+        "--mean-model",
+        choices=("ridge", "elastic_net"),
+        default="ridge",
+        help="Mean-head regularizer (default ridge).",
+    )
+    p.add_argument(
+        "--empirical-quantiles",
+        action="store_true",
+        help="Use QuantileRegressor q10/q50/q90 as the sizer's quantile triple instead of the Gaussian projection.",
+    )
+    p.add_argument(
+        "--no-quantile-heads",
+        action="store_true",
+        help="Skip fitting the quantile heads entirely (faster; forces Gaussian projection).",
+    )
+    p.add_argument("--sigma-floor-quantile", type=float, default=0.05,
+                   help="Quantile floor on sigma^2 to stabilize the z-score denominator.")
+    p.add_argument(
+        "--target-scale",
+        type=float,
+        default=1.0,
+        help="Scale of the tanh output (c); Sharpe is scale-invariant but this sets submission magnitude.",
+    )
+    p.add_argument(
+        "--clip-quantile",
+        type=float,
+        default=0.999,
+        help="Safety clip on |target_position| (1.0 disables).",
+    )
+
+    # News block
+    p.add_argument(
+        "--no-news",
+        action="store_true",
+        help="Disable the news-identity feature block (OHLC-only ablation).",
+    )
+    p.add_argument(
+        "--news-svd-components",
+        type=int,
+        default=16,
+        help="TruncatedSVD rank for the headline topic fingerprint (0 disables topic block).",
+    )
+    p.add_argument(
+        "--news-top-entities",
+        type=int,
+        default=10,
+        help="Number of top train companies tracked as dedicated footprint features.",
+    )
+    p.add_argument(
+        "--news-half-life",
+        type=float,
+        default=10.0,
+        help="Decay half-life (in bars) for time-to-decision news weighting.",
+    )
+
+    p.add_argument("--ranking-out", type=Path, default=None, help="Optional ranking frame dump path.")
+    p.add_argument(
+        "--fixed-sizing-in",
+        type=Path,
+        default=None,
+        help="Optional JSON file containing a fixed sizing config to reuse instead of OOF tuning.",
+    )
+    p.add_argument(
+        "--diagnostics-out",
+        type=Path,
+        default=None,
+        help="Optional path to dump diagnostics JSON.",
+    )
+    p.add_argument(
+        "--tag",
+        type=str,
+        default="prob-reg",
+        help="Prefix tag used in the output submission filename.",
+    )
+    p.add_argument(
+        "--submission-out",
+        type=Path,
+        default=None,
+        help="Optional exact output path for the submission CSV.",
+    )
+    return p.parse_args()
+
+
+def main() -> None:
+    args = _parse_args()
+
+    data_dir = (args.data_dir or default_data_dir()).resolve()
+    if not data_dir.is_dir():
+        raise SystemExit(f"Data directory not found: {data_dir}")
+
+    submissions_dir = (args.submissions_dir or default_sub_dir()).resolve()
+    submissions_dir.mkdir(parents=True, exist_ok=True)
+
+    heads_cfg = HeadsConfig(
+        mean_regularizer=str(args.mean_model),
+        use_gaussian_quantiles=not bool(args.empirical_quantiles),
+        enable_quantile=not bool(args.no_quantile_heads),
+        sigma_floor_quantile=float(args.sigma_floor_quantile),
+        cv_splits=int(args.cv_splits),
+        random_state=int(args.seed),
+    )
+    news_cfg = NewsConfig(
+        enabled=not bool(args.no_news),
+        svd_components=int(args.news_svd_components),
+        top_entities=int(args.news_top_entities),
+        decay_half_life=float(args.news_half_life),
+        include_summary_features=False,  # we already have OHLC features first-class
+    )
+    cfg = ProbRegConfig(
+        random_state=int(args.seed),
+        heads=heads_cfg,
+        news=news_cfg,
+        target_scale=float(args.target_scale),
+        clip_quantile=float(args.clip_quantile),
+    )
+    if args.fixed_sizing_in is not None:
+        sizing_payload = json.loads(Path(args.fixed_sizing_in).read_text(encoding="utf-8"))
+        cfg.fixed_sizing = SizingConfig(**sizing_payload)
+
+    result = run_pipeline(data_dir, cfg)
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    safe_tag = args.tag.replace(" ", "-").replace("/", "-")
+    out_path = Path(args.submission_out) if args.submission_out is not None else submissions_dir / f"{safe_tag}_submission_{timestamp}.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    result.submission.to_csv(out_path, index=False)
+
+    print(f"Wrote {len(result.submission)} rows to {out_path}")
+    diag = dict(result.diagnostics)
+    diag["tuned_sizing"] = dataclasses.asdict(result.tuned_sizing)
+    print("Diagnostics:")
+    print(json.dumps(diag, indent=2, default=float))
+    if args.diagnostics_out is not None:
+        dp = Path(args.diagnostics_out)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        dp.write_text(json.dumps(diag, indent=2, default=float) + "\n", encoding="utf-8")
+        print(f"Diagnostics dumped to {dp.resolve()}")
+
+    if args.ranking_out is not None:
+        rp = Path(args.ranking_out)
+        rp.parent.mkdir(parents=True, exist_ok=True)
+        result.rankings.to_csv(rp, index=False)
+        print(f"Ranking dumped to {rp.resolve()}")
+
+
+if __name__ == "__main__":
+    main()
