@@ -3,6 +3,8 @@
 Policies (``distributional_policy``):
 
 - ``prob_sign``: logistic regression on ``1[R > 0]``, then ``f = 2p - 1`` (monotone in ``p``).
+- ``prob_sign_sharpe``: same logistic, then choose ``α > 0`` to maximize train Sharpe of
+  ``f = tanh(α · clip(logit(p)))`` (monotone in ``p``); then apply the usual global ``mult``.
 - ``quantile_median``: linear quantile regression at τ=0.5, then ``f = tanh(m / σ)`` with
   ``σ = std(m)`` on the fit rows (monotone in predicted median).
 - ``rank_score``: Ridge score on ``R``, map to train empirical rank percentiles, ``f = 2·pct - 1``
@@ -15,11 +17,16 @@ from dataclasses import dataclass
 from typing import Literal
 
 import numpy as np
+from scipy.optimize import minimize_scalar
 from sklearn.linear_model import LogisticRegression, QuantileRegressor, Ridge
 from sklearn.pipeline import Pipeline
 from sklearn.preprocessing import StandardScaler
 
-DistributionalPolicy = Literal["prob_sign", "quantile_median", "rank_score"]
+from datathon_baseline.metrics import sharpe
+
+DistributionalPolicy = Literal[
+    "prob_sign", "prob_sign_sharpe", "quantile_median", "rank_score"
+]
 
 
 @dataclass
@@ -33,11 +40,15 @@ class DistributionalMonoPredictor:
     _rank_scaler: StandardScaler | None = None
     _rank_ridge: Ridge | None = None
     _rank_s_sorted: np.ndarray | None = None
+    # prob_sign_sharpe: f = tanh(alpha * logit_clip(p))
+    _prob_sharpe_alpha: float | None = None
 
     def predict_prob_positive(self, X: np.ndarray) -> np.ndarray:
-        """For ``prob_sign`` only: return ``P(R > 0 | X)`` per row."""
-        if self.policy != "prob_sign" or self._prob_pipe is None:
-            raise ValueError("predict_prob_positive is only defined for policy prob_sign")
+        """For ``prob_sign`` / ``prob_sign_sharpe``: return ``P(R > 0 | X)`` per row."""
+        if self.policy not in ("prob_sign", "prob_sign_sharpe") or self._prob_pipe is None:
+            raise ValueError(
+                "predict_prob_positive is only defined for prob_sign and prob_sign_sharpe"
+            )
         X = np.asarray(X, dtype=np.float64)
         return self._prob_pipe.predict_proba(X)[:, 1].astype(np.float64)
 
@@ -47,6 +58,11 @@ class DistributionalMonoPredictor:
             assert self._prob_pipe is not None
             p = self._prob_pipe.predict_proba(X)[:, 1].astype(np.float64)
             return 2.0 * p - 1.0
+        if self.policy == "prob_sign_sharpe":
+            assert self._prob_pipe is not None and self._prob_sharpe_alpha is not None
+            p = self._prob_pipe.predict_proba(X)[:, 1].astype(np.float64)
+            z = logit_clip(p)
+            return np.tanh(float(self._prob_sharpe_alpha) * z)
         if self.policy == "quantile_median":
             assert self._quantile_pipe is not None
             m = self._quantile_pipe.predict(X).astype(np.float64)
@@ -79,10 +95,11 @@ def fit_distributional_mono(
     """
     ``ridge_reg`` is:
 
-    - inverse L2 strength for ``LogisticRegression`` (``C = 1 / ridge_reg``) in ``prob_sign``;
+    - inverse L2 strength for ``LogisticRegression`` (``C = 1 / ridge_reg``) in ``prob_sign`` /
+      ``prob_sign_sharpe``;
     - ``alpha`` for ``QuantileRegressor`` / ``Ridge`` in other policies.
     """
-    allowed = ("prob_sign", "quantile_median", "rank_score")
+    allowed = ("prob_sign", "prob_sign_sharpe", "quantile_median", "rank_score")
     if policy not in allowed:
         raise ValueError(f"policy must be one of {allowed}, got {policy!r}")
     policy_t: DistributionalPolicy = policy  # type: ignore[assignment]
@@ -108,6 +125,33 @@ def fit_distributional_mono(
         )
         pipe.fit(X_raw, y)
         return DistributionalMonoPredictor(policy=policy_t, _prob_pipe=pipe)
+
+    if policy_t == "prob_sign_sharpe":
+        y = (R > 0.0).astype(np.int32)
+        C = 1.0 / max(float(ridge_reg), 1e-12)
+        pipe = Pipeline(
+            [
+                ("scaler", StandardScaler()),
+                (
+                    "clf",
+                    LogisticRegression(
+                        C=C,
+                        max_iter=5000,
+                        random_state=random_state,
+                        solver="lbfgs",
+                    ),
+                ),
+            ]
+        )
+        pipe.fit(X_raw, y)
+        p_fit = pipe.predict_proba(X_raw)[:, 1].astype(np.float64)
+        z_fit = logit_clip(p_fit)
+        alpha_opt = _optimize_prob_sign_sharpe_alpha(z_fit, R)
+        return DistributionalMonoPredictor(
+            policy=policy_t,
+            _prob_pipe=pipe,
+            _prob_sharpe_alpha=float(alpha_opt),
+        )
 
     if policy_t == "quantile_median":
         pipe = Pipeline(
@@ -160,7 +204,7 @@ def shap_linear_parts(
     as Ridge / Sharpe-linear: ``phi_ij = coef_j * (x_ij - mean_j)`` on scaled columns.
     """
     X_raw = np.asarray(X_raw, dtype=np.float64)
-    if pred.policy == "prob_sign":
+    if pred.policy in ("prob_sign", "prob_sign_sharpe"):
         assert pred._prob_pipe is not None
         scaler = pred._prob_pipe.named_steps["scaler"]
         clf = pred._prob_pipe.named_steps["clf"]
@@ -182,6 +226,33 @@ def shap_linear_parts(
     raise ValueError(pred.policy)
 
 
+def logit_clip(p: np.ndarray, lim: float = 10.0) -> np.ndarray:
+    """Log-odds with ``p`` clipped; output clipped to ``[-lim, lim]`` for stability."""
+    p = np.clip(np.asarray(p, dtype=np.float64), 1e-15, 1.0 - 1e-15)
+    z = np.log(p / (1.0 - p))
+    return np.clip(z, -lim, lim)
+
+
+def _optimize_prob_sign_sharpe_alpha(z: np.ndarray, R: np.ndarray) -> float:
+    """
+    Maximize train Sharpe of ``w = mult * tanh(exp(log_a) * z)`` over ``log_a`` in a bounded range.
+    ``mult`` matches ``train_model`` (flip if mean(f * R) < 0 on fit rows).
+    """
+    z = np.asarray(z, dtype=np.float64)
+    R = np.asarray(R, dtype=np.float64)
+
+    def neg_sharpe(log_a: float) -> float:
+        a = float(np.exp(log_a))
+        f = np.tanh(a * z)
+        mult = -1.0 if float(np.mean(f * R)) < 0 else 1.0
+        return -float(sharpe(mult * f * R))
+
+    res = minimize_scalar(neg_sharpe, bounds=(-4.0, 4.0), method="bounded")
+    if not res.success:
+        return 1.0
+    return float(np.exp(float(res.x)))
+
+
 def binary_entropy_nats(p: np.ndarray) -> np.ndarray:
     """Binary entropy -p log p - (1-p) log(1-p) with natural log (nats); p clipped to (1e-15, 1-1e-15)."""
     p = np.clip(np.asarray(p, dtype=np.float64), 1e-15, 1.0 - 1e-15)
@@ -194,4 +265,5 @@ __all__ = [
     "fit_distributional_mono",
     "shap_linear_parts",
     "binary_entropy_nats",
+    "logit_clip",
 ]

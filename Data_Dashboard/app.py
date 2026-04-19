@@ -21,6 +21,9 @@ _DATA_FALLBACK = Path(__file__).resolve().parent.parent / "data"
 BARS_SEEN_TRAIN = "bars_seen_train.parquet"
 BARS_UNSEEN_TRAIN = "bars_unseen_train.parquet"
 
+SENTIMENTS_SEEN_TRAIN_CSV = "sentiments_seen_train.csv"
+SENTIMENTS_UNSEEN_TRAIN_CSV = "sentiments_unseen_train.csv"
+
 COMBINED_TRAIN = "Train — combined (seen + unseen)"
 TRAIN_CHOICES = frozenset(
     {
@@ -497,9 +500,361 @@ def fig_candlestick_with_news(
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
         margin=dict(l=48, r=24, t=56, b=48),
     )
-    fig.update_yaxes(title_text="Price", row=1, col=1)
+    fig.update_yaxes(range=[0.93, 1.07], title_text="Price", row=1, col=1)
     fig.update_yaxes(title_text="Return", row=2, col=1, tickformat=".2%")
     fig.update_xaxes(title_text="bar_ix", row=2, col=1)
+    return fig
+
+
+def train_session_sectors_from_sentiment_csv(
+    data_dir: Path,
+    train_session_ids: list[int] | np.ndarray,
+) -> pd.Series:
+    """
+    Index: train session id; value: mode of `sector` across sentiments_seen + sentiments_unseen rows.
+
+    If CSVs are missing or invalid, every session is labeled ``Unknown``.
+    """
+    ids = sorted({int(x) for x in train_session_ids})
+    p_seen = data_dir / SENTIMENTS_SEEN_TRAIN_CSV
+    p_unseen = data_dir / SENTIMENTS_UNSEEN_TRAIN_CSV
+    if not p_seen.is_file() or not p_unseen.is_file():
+        return pd.Series("Unknown", index=ids, dtype=object)
+    seen = pd.read_csv(p_seen)
+    unseen = pd.read_csv(p_unseen)
+    if "sector" not in seen.columns or "sector" not in unseen.columns:
+        return pd.Series("Unknown", index=ids, dtype=object)
+    h = pd.concat([seen, unseen], ignore_index=True)
+
+    def _mode_sector(s: pd.Series) -> str:
+        s = s.dropna()
+        if s.empty:
+            return "Unknown"
+        return str(s.value_counts().index[0])
+
+    modes = h.groupby("session", sort=True)["sector"].apply(_mode_sector)
+    return modes.reindex(ids).fillna("Unknown")
+
+
+def _train_session_seen_return_through_bar49(bars_seen: pd.DataFrame) -> pd.Series:
+    """
+    Return from session start through end of seen window:
+    close(bar_ix 49) / open(bar_ix 0) - 1 on `bars_seen_train` only.
+    """
+    out: dict[int, float] = {}
+    for session in sorted(bars_seen["session"].unique()):
+        sid = int(session)
+        bs = bars_seen[bars_seen["session"] == sid].sort_values("bar_ix")
+        if bs.empty:
+            continue
+        o0 = bs.loc[bs["bar_ix"] == 0, "open"]
+        c49 = bs.loc[bs["bar_ix"] == 49, "close"]
+        if len(o0) != 1 or len(c49) != 1:
+            continue
+        out[sid] = float(c49.iloc[0]) / float(o0.iloc[0]) - 1.0
+    return pd.Series(out, dtype=np.float64)
+
+
+def _train_session_unseen_R(
+    bars_seen: pd.DataFrame,
+    bars_unseen: pd.DataFrame,
+) -> pd.Series:
+    """
+    README-style label per session: R = close(bar_ix 99) / close(bar_ix 49) - 1
+    (return from end of seen window to bar 99 — the “50–99” / decision-relevant leg).
+    """
+    out: dict[int, float] = {}
+    for session in sorted(bars_seen["session"].unique()):
+        sid = int(session)
+        bs = bars_seen[bars_seen["session"] == sid].sort_values("bar_ix")
+        bu = bars_unseen[bars_unseen["session"] == sid].sort_values("bar_ix")
+        if bs.empty or bu.empty:
+            continue
+        c49 = bs.loc[bs["bar_ix"] == 49, "close"]
+        c99 = bu.loc[bu["bar_ix"] == 99, "close"]
+        if len(c49) != 1 or len(c99) != 1:
+            continue
+        out[sid] = float(c99.iloc[0]) / float(c49.iloc[0]) - 1.0
+    return pd.Series(out, dtype=np.float64)
+
+
+# Path colors: 4 quadrants = (seen to bar49 up?, unseen R up?) with R = close99/close49 − 1.
+_QUAD_PATH_SOLID: dict[tuple[bool, bool], str] = {
+    (True, True): "#26a69a",
+    (True, False): "#42a5f5",
+    (False, True): "#ffca28",
+    (False, False): "#ef5350",
+}
+_QUAD_PATH_RGBA: dict[tuple[bool, bool], str] = {
+    (True, True): "rgba(38, 166, 154, 0.22)",
+    (True, False): "rgba(66, 165, 245, 0.22)",
+    (False, True): "rgba(255, 202, 40, 0.22)",
+    (False, False): "rgba(239, 83, 80, 0.22)",
+}
+_QUAD_LEGEND: dict[tuple[bool, bool], str] = {
+    (True, True): "seen↑ R↑",
+    (True, False): "seen↑ R↓",
+    (False, True): "seen↓ R↑",
+    (False, False): "seen↓ R↓",
+}
+
+
+def _train_normalized_paths_long(
+    bars_seen: pd.DataFrame,
+    bars_unseen: pd.DataFrame,
+) -> pd.DataFrame:
+    """One row per (session, bar_ix): normalized close = close / first open of that session."""
+    full = pd.concat([bars_seen, bars_unseen], ignore_index=True).sort_values(
+        ["session", "bar_ix"]
+    )
+    parts: list[pd.DataFrame] = []
+    for session, g in full.groupby("session", sort=True):
+        g = g.sort_values("bar_ix")
+        if g.empty:
+            continue
+        o0 = float(g["open"].iloc[0])
+        if o0 == 0.0:
+            continue
+        parts.append(
+            g.assign(
+                norm_close=g["close"].astype(np.float64) / o0,
+                session=int(session),
+            )[["session", "bar_ix", "norm_close"]]
+        )
+    if not parts:
+        return pd.DataFrame(columns=["session", "bar_ix", "norm_close"])
+    return pd.concat(parts, ignore_index=True)
+
+
+def fig_train_combined_all_sessions(
+    bars_seen: pd.DataFrame,
+    bars_unseen: pd.DataFrame,
+    *,
+    show_spaghetti: bool = False,
+    sample_paths: int = 28,
+    y_axis_mode: str = "auto",
+    allowed_sessions: set[int] | None = None,
+    chart_title_note: str = "",
+) -> go.Figure:
+    """
+    Cross-sectional distribution of normalized paths (readable default), optional spaghetti.
+
+    `y_axis_mode`: "auto" uses percentile span + padding; "fixed" uses 0.93–1.07.
+    `allowed_sessions`: if set, keep only these session ids (e.g. headline sector filter).
+    """
+    long_df = _train_normalized_paths_long(bars_seen, bars_unseen)
+    if allowed_sessions is not None:
+        long_df = long_df[long_df["session"].isin(allowed_sessions)]
+    if long_df.empty:
+        fig = go.Figure()
+        fig.update_layout(
+            title="No paths to plot",
+            template="plotly_dark",
+            paper_bgcolor="#0e1117",
+            height=400,
+        )
+        return fig
+
+    n_sessions = int(long_df["session"].nunique())
+
+    seen_ret_by_session = _train_session_seen_return_through_bar49(bars_seen)
+    R_by_session = _train_session_unseen_R(bars_seen, bars_unseen)
+
+    def _seen_val(sid: int) -> float:
+        if sid not in seen_ret_by_session.index:
+            return float("nan")
+        return float(seen_ret_by_session.loc[sid])
+
+    def _r_val(sid: int) -> float:
+        if sid not in R_by_session.index:
+            return float("nan")
+        return float(R_by_session.loc[sid])
+
+    def _quadrant(sid: int) -> tuple[bool, bool]:
+        """(seen to bar49 return > 0, unseen R > 0). Missing data → (False, False)."""
+        sv, rv = _seen_val(sid), _r_val(sid)
+        if np.isnan(sv) or np.isnan(rv):
+            return (False, False)
+        return (sv > 0.0, rv > 0.0)
+
+    stats = (
+        long_df.groupby("bar_ix", sort=True)["norm_close"]
+        .agg(
+            p05=lambda s: float(s.quantile(0.05)),
+            p25=lambda s: float(s.quantile(0.25)),
+            p50=lambda s: float(s.quantile(0.50)),
+            p75=lambda s: float(s.quantile(0.75)),
+            p95=lambda s: float(s.quantile(0.95)),
+            mean="mean",
+        )
+        .reset_index()
+    )
+    bx = stats["bar_ix"].to_numpy(dtype=np.float64)
+
+    fig = go.Figure()
+
+    if show_spaghetti:
+
+        def _spaghetti_xy_for_sessions(sessions: list[int]) -> tuple[list[float | None], list[float | None]]:
+            xs: list[float | None] = []
+            ys: list[float | None] = []
+            for sid in sessions:
+                g = long_df[long_df["session"] == sid].sort_values("bar_ix")
+                if g.empty:
+                    continue
+                xs.extend(g["bar_ix"].tolist())
+                xs.append(None)
+                ys.extend(g["norm_close"].tolist())
+                ys.append(None)
+            return xs, ys
+
+        sess_list = sorted(int(s) for s in long_df["session"].unique().tolist())
+        buckets: dict[tuple[bool, bool], list[int]] = {k: [] for k in _QUAD_PATH_SOLID}
+        for sid in sess_list:
+            buckets[_quadrant(sid)].append(sid)
+        for qk, sessions in buckets.items():
+            if not sessions:
+                continue
+            xs, ys = _spaghetti_xy_for_sessions(sessions)
+            if not xs:
+                continue
+            nq = len(sessions)
+            fig.add_trace(
+                go.Scattergl(
+                    x=xs,
+                    y=ys,
+                    mode="lines",
+                    line=dict(width=0.5, color=_QUAD_PATH_RGBA[qk]),
+                    name=f"All paths · {_QUAD_LEGEND[qk]} (n={nq})",
+                    legendgroup=f"spaghetti_{qk}",
+                    showlegend=True,
+                    hoverinfo="skip",
+                )
+            )
+
+    def _band(upper: np.ndarray, lower: np.ndarray, name: str, fillcolor: str) -> go.Scatter:
+        x_poly = np.concatenate([bx, bx[::-1]])
+        y_poly = np.concatenate([upper, lower[::-1]])
+        return go.Scatter(
+            x=x_poly,
+            y=y_poly,
+            fill="toself",
+            fillcolor=fillcolor,
+            line=dict(width=0, color="rgba(0,0,0,0)"),
+            name=name,
+            hoverinfo="skip",
+            showlegend=True,
+        )
+
+    fig.add_trace(
+        _band(
+            stats["p95"].to_numpy(),
+            stats["p05"].to_numpy(),
+            "5th–95th percentile",
+            "rgba(100, 181, 246, 0.14)",
+        )
+    )
+    fig.add_trace(
+        _band(
+            stats["p75"].to_numpy(),
+            stats["p25"].to_numpy(),
+            "25th–75th percentile (IQR)",
+            "rgba(100, 181, 246, 0.28)",
+        )
+    )
+
+    rng = np.random.default_rng(42)
+    sessions_unique = long_df["session"].unique()
+    if sample_paths > 0 and len(sessions_unique) > 0:
+        n_pick = min(sample_paths, len(sessions_unique))
+        picked = rng.choice(sessions_unique, size=n_pick, replace=False)
+        picked_sorted = sorted(int(s) for s in picked)
+        leg_done: dict[tuple[bool, bool], bool] = {k: False for k in _QUAD_PATH_SOLID}
+        for sid in picked_sorted:
+            g = long_df[long_df["session"] == sid].sort_values("bar_ix")
+            qk = _quadrant(sid)
+            c = _QUAD_PATH_SOLID[qk]
+            sv, rv = _seen_val(sid), _r_val(sid)
+            s_txt = f"{sv:.6f}" if not np.isnan(sv) else "n/a"
+            r_txt = f"{rv:.6f}" if not np.isnan(rv) else "n/a"
+            sl = not leg_done[qk]
+            leg_done[qk] = True
+            nm = f"Sample · {_QUAD_LEGEND[qk]}" if sl else ""
+            fig.add_trace(
+                go.Scatter(
+                    x=g["bar_ix"],
+                    y=g["norm_close"],
+                    mode="lines",
+                    line=dict(width=1.2, color=c),
+                    name=nm or "Sample paths",
+                    legendgroup=f"sample_{qk}",
+                    showlegend=sl,
+                    hovertemplate=(
+                        f"session {sid}<br>seen to 49={s_txt} (close49/open0-1)<br>"
+                        f"unseen R={r_txt} (close99/close49-1)<br>"
+                        "bar_ix=%{x}<br>norm close=%{y:.4f}<extra></extra>"
+                    ),
+                )
+            )
+
+    fig.add_trace(
+        go.Scatter(
+            x=stats["bar_ix"],
+            y=stats["p50"],
+            mode="lines",
+            name="Median",
+            line=dict(width=2.8, color="#eceff1"),
+            hovertemplate="bar %{x}<br>median %{y:.4f}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=stats["bar_ix"],
+            y=stats["mean"],
+            mode="lines",
+            name="Mean",
+            line=dict(width=1.8, color="#ffb74d", dash="dot"),
+            hovertemplate="bar %{x}<br>mean %{y:.4f}<extra></extra>",
+        )
+    )
+    fig.add_hline(
+        y=1.0,
+        line_dash="dash",
+        line_color="rgba(255, 255, 255, 0.25)",
+        annotation_text="Start (1.0)",
+        annotation_position="left",
+    )
+
+    fig.add_vline(
+        x=49.5,
+        line_dash="dash",
+        line_color="rgba(255, 255, 255, 0.45)",
+        annotation_text="Seen | Unseen",
+        annotation_position="top",
+    )
+    fig.update_layout(
+        title=(
+            f"Train combined — {n_sessions} sessions — "
+            f"distribution of normalized close paths (close ÷ session first open){chart_title_note}"
+        ),
+        template="plotly_dark",
+        paper_bgcolor="#0e1117",
+        plot_bgcolor="#161b22",
+        height=560,
+        margin=dict(l=48, r=24, t=56, b=48),
+        legend=dict(orientation="h", yanchor="bottom", y=1.05, xanchor="left", x=0),
+        xaxis_title="bar_ix",
+        yaxis_title="Normalized close",
+    )
+    if y_axis_mode == "fixed":
+        fig.update_yaxes(range=[0.93, 1.07])
+    else:
+        pad = 0.004
+        y_lo = float(stats["p05"].min()) - pad
+        y_hi = float(stats["p95"].max()) + pad
+        y_lo = max(y_lo, 0.88)
+        y_hi = min(y_hi, 1.12)
+        fig.update_yaxes(range=[y_lo, y_hi])
     return fig
 
 
@@ -701,6 +1056,100 @@ def main() -> None:
                 margin=dict(l=48, r=24, t=48, b=48),
             )
             st.plotly_chart(fig_h, use_container_width=True, key=f"overview_hist_headlines_{choice}")
+
+        if choice == COMBINED_TRAIN:
+            assert bars_seen is not None and bars_unseen is not None
+            st.subheader("All sessions on one chart (train combined)")
+            st.caption(
+                "Default view: **cross-sectional percentiles** at each bar (across the 1000 sessions) — "
+                "much easier to read than 1000 overlapping lines. "
+                "Normalized close = **close ÷ first open** of that session; bars 0–49 seen, 50–99 unseen."
+            )
+            if not (data_path / SENTIMENTS_SEEN_TRAIN_CSV).is_file() or not (
+                data_path / SENTIMENTS_UNSEEN_TRAIN_CSV
+            ).is_file():
+                st.warning(
+                    f"Add `{SENTIMENTS_SEEN_TRAIN_CSV}` and `{SENTIMENTS_UNSEEN_TRAIN_CSV}` next to your "
+                    "parquet files to enable sector filtering (otherwise every session is **Unknown**)."
+                )
+            sector_by_session = train_session_sectors_from_sentiment_csv(
+                data_path, bars_seen["session"].unique()
+            )
+            sector_options = sorted(sector_by_session.unique().tolist())
+            sector_pick = st.multiselect(
+                "Filter by sector (from sentiment CSVs)",
+                options=sector_options,
+                default=sector_options,
+                key="overview_train_sectors",
+                help=(
+                    "Uses the **`sector`** column in `sentiments_seen_train.csv` and "
+                    "`sentiments_unseen_train.csv`. Per session, the label is the **mode** (most frequent) "
+                    "sector across all headline rows in seen + unseen."
+                ),
+            )
+            if len(sector_pick) == 0:
+                st.warning("Select at least one sector. Showing all categories until you choose at least one.")
+                sector_pick = list(sector_options)
+            if set(sector_pick) == set(sector_options):
+                allowed_sess: set[int] | None = None
+                chart_title_note = ""
+            else:
+                allowed_sess = set(
+                    int(x) for x in sector_by_session[sector_by_session.isin(sector_pick)].index.tolist()
+                )
+                chart_title_note = " — sector filter (sentiment CSV)"
+                st.caption(
+                    f"**Sessions in view:** {len(allowed_sess)} of {len(sector_by_session)} "
+                    "(after sector filter)."
+                )
+            oc1, oc2, oc3 = st.columns([1, 1, 1])
+            with oc1:
+                show_spaghetti = st.checkbox(
+                    "Show all 1000 paths (spaghetti, faint)",
+                    value=False,
+                    key="overview_train_spaghetti",
+                    help=(
+                        "Behind the bands. Four colors: seen window to bar 49 up/down "
+                        "(close49/open0−1) × unseen leg up/down (close99/close49−1, README R)."
+                    ),
+                )
+            with oc2:
+                n_sample = st.slider(
+                    "Sample paths (random)",
+                    min_value=0,
+                    max_value=80,
+                    value=28,
+                    step=1,
+                    key="overview_train_sample_n",
+                    help=(
+                        "Paths on top of bands; 0 hides them. Same 4-way color key as spaghetti "
+                        "(seen→49 return vs unseen R)."
+                    ),
+                )
+            with oc3:
+                y_mode = st.radio(
+                    "Y-axis",
+                    ("Auto (percentile span)", "Fixed 0.93 – 1.07"),
+                    horizontal=True,
+                    key="overview_train_yaxis",
+                )
+            fig_all = fig_train_combined_all_sessions(
+                bars_seen,
+                bars_unseen,
+                show_spaghetti=show_spaghetti,
+                sample_paths=n_sample,
+                y_axis_mode="fixed" if y_mode.startswith("Fixed") else "auto",
+                allowed_sessions=allowed_sess,
+                chart_title_note=chart_title_note,
+            )
+            st.plotly_chart(
+                fig_all,
+                use_container_width=True,
+                key=(
+                    f"overview_all_sessions_overlay_{choice}_{show_spaghetti}_{n_sample}_{y_mode}_"
+                    f"{','.join(sorted(sector_pick))}"
+                ),
+            )
 
         if choice in TRAIN_CHOICES:
             st.subheader("Train: features (seen) vs labels (unseen)")

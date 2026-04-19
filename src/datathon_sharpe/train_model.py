@@ -72,8 +72,8 @@ def fit_full_train_and_submission(
     ``-Sharpe + λ·mean((w - w_ridge)²)`` with ``w = X_design β`` and ``w_ridge`` the Ridge
     prediction of ``R`` (same warm-start). If 0, use unit-sphere Sharpe only (default).
 
-    ``distributional_policy``: for ``distributional_mono`` only — ``prob_sign``, ``quantile_median``,
-    or ``rank_score`` (see ``distributional_mono`` module).
+    ``distributional_policy``: for ``distributional_mono`` only — ``prob_sign``, ``prob_sign_sharpe``,
+    ``quantile_median``, or ``rank_score`` (see ``distributional_mono`` module).
     """
     feat_main, feat_fit = load_training_feature_matrices(
         data_dir,
@@ -234,6 +234,14 @@ def fit_full_train_and_submission(
         mse_anchor_lambda=mse_anchor_lambda if method == Method.sharpe_linear else None,
         distributional_policy=(
             distributional_policy if method == Method.distributional_mono else None
+        ),
+        prob_sign_sharpe_alpha=(
+            float(dist_mono._prob_sharpe_alpha)
+            if method == Method.distributional_mono
+            and distributional_policy == "prob_sign_sharpe"
+            and dist_mono is not None
+            and getattr(dist_mono, "_prob_sharpe_alpha", None) is not None
+            else None
         ),
     )
     return train_pred, sub, result

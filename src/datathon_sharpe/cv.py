@@ -69,7 +69,7 @@ def run_cv_report(
     ``mse_anchor_lambda``: Sharpe-linear only; passed to ``fit_full_train_and_submission``
     (0 = unit-sphere Sharpe; >0 adds MSE anchor to Ridge positions).
 
-    ``distributional_policy``: ``distributional_mono`` only (``prob_sign``, ``quantile_median``, ``rank_score``).
+    ``distributional_policy``: ``distributional_mono`` only (``prob_sign``, ``prob_sign_sharpe``, …).
     """
     from datathon_sharpe.split import train_session_pool
 

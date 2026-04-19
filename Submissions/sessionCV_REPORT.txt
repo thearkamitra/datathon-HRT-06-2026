@@ -1,0 +1,26 @@
+Session-level CV (K-fold over train session ids; val Sharpe = held-out train, competition R).
+data_dir=/Users/jonas/Desktop/School/Challenges/2026 Datathon/datathon-HRT-06-2026/data
+ridge_alpha=1.0  l1_ratio=0.0  mse_anchor_lambda=0.0
+sharpe_optimizer_label=identity
+n_splits=5  augment_test_with_proxy=True
+
+cv_seed=0  |  sharpe_linear: 2.717104 +/- 0.864358  folds=['3.9533', '2.4915', '2.6770', '1.3143', '3.1494']
+cv_seed=0  |  prob_sign:     2.884268 +/- 0.672609  folds=['3.9079', '2.6611', '2.5617', '1.9575', '3.3330']
+
+cv_seed=1  |  sharpe_linear: 2.803614 +/- 1.455783  folds=['2.6029', '0.4526', '4.9410', '3.4437', '2.5777']
+cv_seed=1  |  prob_sign:     2.953629 +/- 1.377623  folds=['2.8928', '0.5787', '4.8149', '3.5697', '2.9121']
+
+cv_seed=2  |  sharpe_linear: 3.009565 +/- 1.021325  folds=['3.5140', '1.2358', '3.6912', '2.5361', '4.0708']
+cv_seed=2  |  prob_sign:     3.038184 +/- 0.816538  folds=['3.3103', '1.6701', '2.9625', '3.0341', '4.2139']
+
+cv_seed=3  |  sharpe_linear: 2.828625 +/- 1.378476  folds=['2.0104', '1.9650', '4.6936', '1.2220', '4.2521']
+cv_seed=3  |  prob_sign:     2.996830 +/- 1.421873  folds=['2.3393', '2.0579', '5.1103', '1.2902', '4.1865']
+
+cv_seed=4  |  sharpe_linear: 2.731542 +/- 0.537676  folds=['3.4015', '1.7962', '2.8933', '2.9957', '2.5710']
+cv_seed=4  |  prob_sign:     2.905050 +/- 0.529505  folds=['3.8064', '2.2405', '2.8777', '3.0504', '2.5503']
+
+--- Stability across cv_seed (distribution of mean val Sharpe per fold-run) ---
+sharpe_linear: mean_of_means=2.818090  std_across_cv_seeds=0.104568  min=2.717104  max=3.009565
+prob_sign:     mean_of_means=2.955592  std_across_cv_seeds=0.056864  min=2.884268  max=3.038184
+
+Interpretation: lower std_across_cv_seeds suggests more stable ranking across random KFold shuffles.
