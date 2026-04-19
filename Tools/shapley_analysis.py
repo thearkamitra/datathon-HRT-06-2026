@@ -124,10 +124,15 @@ def analyze(
         meta["ridge_alpha"] = ridge_alpha
         Xs, coef = shap_linear_parts(dist, X_raw)
         phi = _shap_linear_scaled(Xs, coef)
-        if dist.policy == "prob_sign":
+        if dist.policy in ("prob_sign", "prob_sign_sharpe"):
             meta["note"] = (
                 "Linear SHAP on logit margin (logistic coef × scaled features); "
                 "not full Kernel SHAP for probability."
+                + (
+                    " prob_sign_sharpe also uses a Sharpe-tuned tanh map on logits (not in linear SHAP)."
+                    if dist.policy == "prob_sign_sharpe"
+                    else ""
+                )
             )
     else:
         raise ValueError(method)
@@ -183,7 +188,7 @@ def main() -> None:
     p.add_argument(
         "--distributional-policy",
         type=str,
-        choices=["prob_sign", "quantile_median", "rank_score"],
+        choices=["prob_sign", "prob_sign_sharpe", "quantile_median", "rank_score"],
         default="prob_sign",
         help="distributional_mono: which fitted head to explain.",
     )

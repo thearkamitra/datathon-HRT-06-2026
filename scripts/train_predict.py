@@ -51,7 +51,7 @@ def main() -> None:
     p.add_argument(
         "--distributional-policy",
         type=str,
-        choices=["prob_sign", "quantile_median", "rank_score"],
+        choices=["prob_sign", "prob_sign_sharpe", "quantile_median", "rank_score"],
         default="prob_sign",
         help="For --method distributional_mono: target + monotone map (default prob_sign).",
     )
@@ -94,6 +94,8 @@ def main() -> None:
         print(f"Sharpe optimizer: {res.sharpe_opt_message}")
     if res.distributional_policy:
         print(f"Distributional policy: {res.distributional_policy}")
+    if res.prob_sign_sharpe_alpha is not None:
+        print(f"prob_sign_sharpe α: {res.prob_sign_sharpe_alpha:.6f}")
     print(f"Wrote {len(sub)} rows to {args.output.resolve()}")
 
 

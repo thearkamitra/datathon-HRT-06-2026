@@ -97,9 +97,9 @@ def main() -> None:
     p.add_argument(
         "--distributional-policy",
         type=str,
-        choices=["prob_sign", "quantile_median", "rank_score"],
+        choices=["prob_sign", "prob_sign_sharpe", "quantile_median", "rank_score"],
         default="prob_sign",
-        help="distributional_mono only: prob_sign (default), quantile_median, or rank_score.",
+        help="distributional_mono: prob_sign, prob_sign_sharpe (logistic + Sharpe-tuned tanh map), quantile_median, rank_score.",
     )
     args = p.parse_args()
 
@@ -153,6 +153,8 @@ def main() -> None:
             f"Distributional policy: {args.distributional_policy} "
             f"(ridge_reg={args.ridge_alpha} as C⁻¹ / quantile α / Ridge α)"
         )
+        if args.distributional_policy == "prob_sign_sharpe" and report.train_result.prob_sign_sharpe_alpha is not None:
+            print(f"prob_sign_sharpe: optimized α = {report.train_result.prob_sign_sharpe_alpha:.6f} (tanh(α·logit(p)))")
     if args.within_session_split:
         print(
             "Mode: within-session — features bars 0–24, train R = close_49/close_24-1 (proxy; not competition R)."

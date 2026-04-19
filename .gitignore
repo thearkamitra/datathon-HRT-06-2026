@@ -81,3 +81,6 @@ uv.lock
 
 # Competition output (regenerate with scripts/train_predict.py or Submissions/generate_submission.py)
 Submissions/submission.csv
+
+# CSV/text exports from scripts/parquet_to_readable_text.py (large; regenerate locally)
+data/readable_export/

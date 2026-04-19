@@ -41,3 +41,21 @@ def neg_sharpe_linear(
     w = X_design @ beta
     pnl = pnl_from_positions(w, R)
     return -float(sharpe(pnl))
+
+
+def neg_sharpe_mse_anchor(
+    beta: np.ndarray,
+    X_design: np.ndarray,
+    R: np.ndarray,
+    w_base: np.ndarray,
+    mse_lambda: float,
+) -> float:
+    """
+    Combined loss: minus Sharpe plus MSE anchor to Ridge baseline positions ``w_base``:
+
+    ``J(beta) = -Sharpe(w * R) + lambda * mean((w - w_base)**2)`` with ``w = X_design @ beta``.
+    """
+    w = X_design @ beta
+    pnl = pnl_from_positions(w, R)
+    mse = float(np.mean((w - np.asarray(w_base, dtype=np.float64)) ** 2))
+    return -float(sharpe(pnl)) + float(mse_lambda) * mse
