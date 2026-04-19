@@ -1,51 +1,46 @@
-"""Seen-half news / sentiment feature hook for the tailored modeler.
+"""Seen-half headline + sentiment features for the tailored modeler.
 
-Two modes:
+The tailored pipeline selects its three-head booster and Sharpe sizer via
+repeated-KFold out-of-fold predictions. For that reason, the news block avoids
+any train-wide fitted text encoder that would leak fold-level text statistics
+into validation rows before they are scored.
 
-* ``NewsConfig(enabled=False)`` - OHLC-only pipeline. No sentiment data is
-  loaded. Default, identical to the OHLC-only 2.24 baseline.
-* ``NewsConfig(enabled=True)`` - the pipeline loads the sentiment CSVs for
-  the relevant splits and merges per-session aggregates into the feature
-  matrix.
+Instead, the feature family is deliberately **stateless**:
 
-Strict no-leakage contract (Stage 8 of the plan + reviewer's explicit ask):
+* decay-weighted sentiment aggregates,
+* recent-window sentiment aggregates,
+* temporal news-arrival profile,
+* entity / sector concentration descriptors,
+* fixed-width hashed headline fingerprints.
 
-* For train we only consume ``sentiments_seen_train.csv`` - never the
-  ``sentiments_unseen_train.csv`` file. The decision bar is ``bar_ix=49``,
-  which matches the seen-half cutoff in the test parquets.
-* The function asserts ``bar_ix <= decision_bar`` on every event before it
-  aggregates, so even if someone passes a wrong CSV the assertion fires.
+`HashingVectorizer` is used for headline text so there is no fit step and the
+same transformation is valid for train, public test, private test, and
+augmented-train rows without leaking vocabulary / IDF information.
 
-Session-level feature design matches the empirical findings of
-``scripts/validate-sentiment``:
+Strict no-leakage contract:
 
-* ``weighted_score`` / ``weighted_sign`` with half-life ``decay_half_life``
-  bars, weighted by ``confidence``. This captures the "news impact peaks ~k=10
-  ahead and decays" shape we validated (Pearson ~0.20 at the event level).
-* ``late10_*`` aggregates over the last 10 bars (bar 40-49) because those
-  are the events whose impact extends *past* the decision bar into the
-  R = close_end / close_half - 1 window.
-* Simple bookkeeping features (headline count, entity count, max |score|,
-  confidence mean, last-headline sentiment).
-
-Sessions without any seen-half sentiment event (one such session exists in
-the private test) receive zero-filled features (neutral) - no NaNs are
-propagated into the booster.
+* Only seen-half sentiment files are loaded.
+* `sentiments_unseen_train.csv` is intentionally excluded.
+* Any `bar_ix > decision_bar` row raises immediately.
 """
 
 from __future__ import annotations
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
+from sklearn.feature_extraction.text import HashingVectorizer
 
 
 DEFAULT_DECISION_BAR = 49
 DEFAULT_DECAY_HALF_LIFE = 10.0
 DEFAULT_LATE_WINDOW = 10  # last 10 bars of the seen half
+DEFAULT_HIGH_CONF_THRESHOLD = 0.9
+DEFAULT_HEADLINE_HASH_FEATURES = 32
+DEFAULT_HEADLINE_NGRAM_MAX = 2
 
 SENTIMENT_FILES = {
     "train_seen": "sentiments_seen_train.csv",
@@ -58,15 +53,18 @@ SENTIMENT_FILES = {
 
 @dataclass(frozen=True)
 class NewsConfig:
-    """Configuration for the seen-half sentiment branch."""
+    """Configuration for the seen-half tailored news branch."""
 
     enabled: bool = False
     decision_bar: int = DEFAULT_DECISION_BAR
     decay_half_life: float = DEFAULT_DECAY_HALF_LIFE
     late_window: int = DEFAULT_LATE_WINDOW
+    high_conf_threshold: float = DEFAULT_HIGH_CONF_THRESHOLD
+    headline_hash_features: int = DEFAULT_HEADLINE_HASH_FEATURES
+    headline_ngram_max: int = DEFAULT_HEADLINE_NGRAM_MAX
 
 
-NEWS_FEATURE_COLUMNS: Tuple[str, ...] = (
+_STATIC_NEWS_FEATURE_COLUMNS: Tuple[str, ...] = (
     "news_headline_count",
     "news_entity_count",
     "news_mean_score",
@@ -83,7 +81,36 @@ NEWS_FEATURE_COLUMNS: Tuple[str, ...] = (
     "news_late_weighted_sign",
     "news_late_mean_score",
     "news_late_mean_sign",
+    "news_frac_q1",
+    "news_frac_q2",
+    "news_frac_q3",
+    "news_frac_q4",
+    "news_mean_bar_ix",
+    "news_entity_entropy",
+    "news_top_entity_share",
+    "news_top_entity_weighted_sent",
+    "news_sector_entropy",
+    "news_sector_hhi",
+    "news_sector_num_unique",
+    "news_sector_max_share",
+    "news_granular_sector_entropy",
 )
+
+
+def news_feature_columns(config: NewsConfig) -> list[str]:
+    cols = list(_STATIC_NEWS_FEATURE_COLUMNS)
+    cols.extend(
+        f"news_hash_{i}" for i in range(max(int(config.headline_hash_features), 0))
+    )
+    return cols
+
+
+def _zero_frame(sessions: pd.Series, config: NewsConfig) -> pd.DataFrame:
+    base_sessions = pd.Series(sessions, dtype="int64").astype("int64").unique()
+    out = pd.DataFrame({"session": base_sessions})
+    for col in news_feature_columns(config):
+        out[col] = 0.0
+    return out
 
 
 def _load_sentiment_splits(data_dir: Path, splits: Iterable[str]) -> pd.DataFrame:
@@ -106,39 +133,64 @@ def _load_sentiment_splits(data_dir: Path, splits: Iterable[str]) -> pd.DataFram
     out["bar_ix"] = out["bar_ix"].astype("int64")
     out["sentiment_score"] = out["sentiment_score"].astype("float64")
     out["confidence"] = out["confidence"].astype("float64")
+    for col in ("headline", "company", "sector", "granular_sector"):
+        if col not in out.columns:
+            out[col] = ""
+        out[col] = out[col].fillna("").astype(str)
     out["sign"] = np.where(
         out["sentiment"].astype(str).str.lower() == "buy", 1.0, -1.0
     ).astype("float64")
     return out
 
 
-def _session_level_aggregates(
-    events: pd.DataFrame, *, decision_bar: int, decay_half_life: float, late_window: int
-) -> pd.DataFrame:
+def _prepare_events(events: pd.DataFrame, config: NewsConfig) -> pd.DataFrame:
     if events.empty:
-        return pd.DataFrame(columns=("session",) + NEWS_FEATURE_COLUMNS)
-
-    # No-leakage guard: every event must be observable at decision time.
-    if (events["bar_ix"] > decision_bar).any():
+        return events.copy()
+    if (events["bar_ix"] > config.decision_bar).any():
         raise AssertionError(
-            f"News leakage: found bar_ix > decision_bar ({decision_bar}) in "
-            "sentiment events. Refusing to build features."
+            f"News leakage: found bar_ix > decision_bar ({config.decision_bar}) in "
+            "seen-half sentiment events."
+        )
+    e = events.loc[events["bar_ix"] <= config.decision_bar].copy()
+    gap = np.maximum(config.decision_bar - e["bar_ix"].to_numpy(), 0.0)
+    w_decay = np.exp(-np.log(2.0) * gap / max(config.decay_half_life, 1e-6))
+    conf = e["confidence"].to_numpy(dtype=np.float64)
+    score = e["sentiment_score"].to_numpy(dtype=np.float64)
+    sign = e["sign"].to_numpy(dtype=np.float64)
+    e["w"] = w_decay * conf
+    e["score_w"] = score * e["w"]
+    e["sign_w"] = sign * e["w"]
+    e["high_conf"] = (
+        conf >= float(config.high_conf_threshold)
+    ).astype(np.int32)
+    return e
+
+
+def _sentiment_aggregates(e: pd.DataFrame, config: NewsConfig) -> pd.DataFrame:
+    if e.empty:
+        return pd.DataFrame(
+            columns=[
+                "session",
+                "news_headline_count",
+                "news_entity_count",
+                "news_mean_score",
+                "news_mean_sign",
+                "news_mean_conf",
+                "news_weighted_score",
+                "news_weighted_sign",
+                "news_last_score",
+                "news_last_sign",
+                "news_max_abs_score",
+                "news_high_conf_count",
+                "news_late_count",
+                "news_late_weighted_score",
+                "news_late_weighted_sign",
+                "news_late_mean_score",
+                "news_late_mean_sign",
+            ]
         )
 
-    gap = np.maximum(decision_bar - events["bar_ix"].to_numpy(), 0)
-    w_decay = np.exp(-np.log(2.0) * gap / max(decay_half_life, 1e-6))
-    conf = events["confidence"].to_numpy(dtype=np.float64)
-    score = events["sentiment_score"].to_numpy(dtype=np.float64)
-    sign = events["sign"].to_numpy(dtype=np.float64)
-    weight = w_decay * conf
-
-    e = events.copy()
-    e["w"] = weight
-    e["score_w"] = score * weight
-    e["sign_w"] = sign * weight
-    e["high_conf"] = (conf >= 0.9).astype(np.int32)
-
-    late_mask = e["bar_ix"] >= (decision_bar - late_window + 1)
+    late_mask = e["bar_ix"] >= (config.decision_bar - int(config.late_window) + 1)
     late = e[late_mask]
 
     agg = e.groupby("session").agg(
@@ -205,7 +257,166 @@ def _session_level_aggregates(
             "news_late_mean_sign",
         ]
     ].fillna(0.0)
-    return out[["session"] + list(NEWS_FEATURE_COLUMNS)]
+    return out[
+        [
+            "session",
+            "news_headline_count",
+            "news_entity_count",
+            "news_mean_score",
+            "news_mean_sign",
+            "news_mean_conf",
+            "news_weighted_score",
+            "news_weighted_sign",
+            "news_last_score",
+            "news_last_sign",
+            "news_max_abs_score",
+            "news_high_conf_count",
+            "news_late_count",
+            "news_late_weighted_score",
+            "news_late_weighted_sign",
+            "news_late_mean_score",
+            "news_late_mean_sign",
+        ]
+    ]
+
+
+def _temporal_profile(e: pd.DataFrame, config: NewsConfig) -> pd.DataFrame:
+    if e.empty:
+        return pd.DataFrame(
+            columns=[
+                "session",
+                "news_frac_q1",
+                "news_frac_q2",
+                "news_frac_q3",
+                "news_frac_q4",
+                "news_mean_bar_ix",
+            ]
+        )
+    bins = np.asarray([0, 12, 25, 37, config.decision_bar + 1], dtype=np.int64)
+    q = np.digitize(e["bar_ix"].to_numpy(dtype=np.int64), bins[1:-1]) + 1
+    h = e[["session", "bar_ix"]].copy()
+    h["_quartile"] = np.clip(q, 1, 4)
+    counts = h.groupby(["session", "_quartile"]).size().unstack(fill_value=0)
+    for c in (1, 2, 3, 4):
+        if c not in counts.columns:
+            counts[c] = 0
+    counts = counts[[1, 2, 3, 4]]
+    totals = counts.sum(axis=1).replace(0, 1)
+    fracs = counts.div(totals, axis=0)
+    fracs.columns = ["news_frac_q1", "news_frac_q2", "news_frac_q3", "news_frac_q4"]
+    mean_bar = h.groupby("session")["bar_ix"].mean().rename("news_mean_bar_ix")
+    return fracs.merge(mean_bar, left_index=True, right_index=True).reset_index()
+
+
+def _entity_concentration(e: pd.DataFrame) -> pd.DataFrame:
+    if e.empty:
+        return pd.DataFrame(
+            columns=[
+                "session",
+                "news_entity_entropy",
+                "news_top_entity_share",
+                "news_top_entity_weighted_sent",
+            ]
+        )
+    rows: List[dict] = []
+    for sess, g in e.groupby("session", sort=False):
+        counts = g["company"].astype(str).value_counts()
+        counts = counts[counts.index != ""]
+        total = int(counts.sum())
+        if total == 0:
+            rows.append(
+                {
+                    "session": int(sess),
+                    "news_entity_entropy": 0.0,
+                    "news_top_entity_share": 0.0,
+                    "news_top_entity_weighted_sent": 0.0,
+                }
+            )
+            continue
+        probs = (counts / float(total)).to_numpy(dtype=np.float64)
+        top_entity = str(counts.idxmax())
+        top = g[g["company"].astype(str) == top_entity]
+        top_w = float(top["w"].sum())
+        top_sent = float(
+            np.sum(top["sentiment_score"].to_numpy(dtype=np.float64) * top["w"].to_numpy(dtype=np.float64))
+            / max(top_w, 1e-12)
+        )
+        rows.append(
+            {
+                "session": int(sess),
+                "news_entity_entropy": float(
+                    -np.sum(probs * np.log(np.clip(probs, 1e-12, 1.0)))
+                ),
+                "news_top_entity_share": float(probs.max()) if probs.size else 0.0,
+                "news_top_entity_weighted_sent": top_sent,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _sector_concentration(e: pd.DataFrame) -> pd.DataFrame:
+    if e.empty:
+        return pd.DataFrame(
+            columns=[
+                "session",
+                "news_sector_entropy",
+                "news_sector_hhi",
+                "news_sector_num_unique",
+                "news_sector_max_share",
+                "news_granular_sector_entropy",
+            ]
+        )
+    rows: List[dict] = []
+    for sess, g in e.groupby("session", sort=False):
+        sector = g["sector"].astype(str)
+        vc = sector.value_counts()
+        n = float(len(sector))
+        p = (vc / n).to_numpy(dtype=np.float64) if n > 0 else np.zeros(0, dtype=np.float64)
+        granular = g["granular_sector"].astype(str)
+        gvc = granular.value_counts()
+        p_g = (
+            (gvc / float(len(granular))).to_numpy(dtype=np.float64)
+            if len(granular) > 0
+            else np.zeros(0, dtype=np.float64)
+        )
+        rows.append(
+            {
+                "session": int(sess),
+                "news_sector_entropy": float(-np.sum(p * np.log(p + 1e-12))) if p.size else 0.0,
+                "news_sector_hhi": float(np.sum(p**2)) if p.size else 0.0,
+                "news_sector_num_unique": float(len(vc)),
+                "news_sector_max_share": float(p.max()) if p.size else 0.0,
+                "news_granular_sector_entropy": float(-np.sum(p_g * np.log(p_g + 1e-12)))
+                if p_g.size
+                else 0.0,
+            }
+        )
+    return pd.DataFrame(rows)
+
+
+def _headline_hash_features(e: pd.DataFrame, config: NewsConfig) -> pd.DataFrame:
+    columns = [f"news_hash_{i}" for i in range(max(int(config.headline_hash_features), 0))]
+    if e.empty or not columns:
+        return pd.DataFrame(columns=["session", *columns])
+
+    docs = (
+        e.groupby("session", sort=False)["headline"]
+        .apply(lambda xs: " ".join(str(x) for x in xs.astype(str) if str(x).strip()))
+    )
+    if docs.empty:
+        return pd.DataFrame(columns=["session", *columns])
+
+    vectorizer = HashingVectorizer(
+        n_features=int(config.headline_hash_features),
+        alternate_sign=False,
+        norm="l2",
+        ngram_range=(1, max(1, int(config.headline_ngram_max))),
+        lowercase=True,
+        strip_accents="unicode",
+    )
+    X = vectorizer.transform(docs.fillna(""))
+    dense = X.toarray().astype(np.float64, copy=False)
+    return pd.DataFrame(dense, index=docs.index, columns=columns).reset_index()
 
 
 def build_news_features(
@@ -215,26 +426,21 @@ def build_news_features(
     data_dir: Optional[Path] = None,
     splits: Optional[Iterable[str]] = None,
 ) -> pd.DataFrame:
-    """Return per-session sentiment-derived features (seen-half only).
+    """Return per-session seen-half news features.
 
     Parameters
     ----------
     sessions:
-        The list of sessions we want rows for. Sessions that have no seen-half
-        headline are emitted with zero-filled features.
+        The list of sessions we want rows for. Sessions with no seen-half news
+        are emitted with zero-filled features.
     config:
         ``NewsConfig``. When ``enabled=False`` we short-circuit to an
         all-zero frame (preserves the OHLC-only path bit-for-bit).
     data_dir, splits:
-        Where and which sentiment CSVs to load. Required when
+        Where and which seen-half sentiment CSVs to load. Required when
         ``config.enabled`` is True.
     """
-    base_sessions = pd.Series(sessions, dtype="int64").astype("int64").unique()
-    base = pd.DataFrame({"session": base_sessions})
-
-    zero_frame = base.copy()
-    for col in NEWS_FEATURE_COLUMNS:
-        zero_frame[col] = 0.0
+    zero_frame = _zero_frame(pd.Series(sessions), config)
 
     if not config.enabled:
         return zero_frame
@@ -243,18 +449,23 @@ def build_news_features(
         raise ValueError(
             "build_news_features requires data_dir and splits when enabled=True"
         )
-    events = _load_sentiment_splits(Path(data_dir), list(splits))
-    # Seen-half cut-off: drop anything past the decision bar (belt & braces).
-    events = events[events["bar_ix"] <= config.decision_bar]
-    feats = _session_level_aggregates(
-        events,
-        decision_bar=config.decision_bar,
-        decay_half_life=config.decay_half_life,
-        late_window=config.late_window,
-    )
-    merged = base.merge(feats, on="session", how="left")
-    for col in NEWS_FEATURE_COLUMNS:
+    events = _prepare_events(_load_sentiment_splits(Path(data_dir), list(splits)), config)
+    if events.empty:
+        return zero_frame
+
+    merged = zero_frame[["session"]].copy()
+    for frame in (
+        _sentiment_aggregates(events, config),
+        _temporal_profile(events, config),
+        _entity_concentration(events),
+        _sector_concentration(events),
+        _headline_hash_features(events, config),
+    ):
+        merged = merged.merge(frame, on="session", how="left")
+
+    feature_cols = news_feature_columns(config)
+    for col in feature_cols:
         if col not in merged.columns:
             merged[col] = 0.0
-    merged[list(NEWS_FEATURE_COLUMNS)] = merged[list(NEWS_FEATURE_COLUMNS)].fillna(0.0)
-    return merged[["session"] + list(NEWS_FEATURE_COLUMNS)]
+    merged[feature_cols] = merged[feature_cols].fillna(0.0)
+    return merged[["session"] + feature_cols]

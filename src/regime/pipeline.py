@@ -102,6 +102,7 @@ class RegimeConfig:
     target_scale: float = 1.0
     clip_quantile: float = 0.999
     seen_bars: int = 50
+    fixed_sizing: Optional[SizingConfig] = None
 
 
 @dataclass
@@ -513,12 +514,32 @@ def run_pipeline(
 
     # ---- Tune the Sharpe-aware sizer --------------------------------------
     _log("pipeline", "phase 2/3: tune Sharpe-aware sizer on OOF predictions")
-    tuned_cfg, tune_info = tune_sizing(
-        oof_preds,
-        y_aligned,
-        target_scale=config.target_scale,
-        clip_quantile=config.clip_quantile,
-    )
+    if config.fixed_sizing is None:
+        tuned_cfg, tune_info = tune_sizing(
+            oof_preds,
+            y_aligned,
+            target_scale=config.target_scale,
+            clip_quantile=config.clip_quantile,
+        )
+        sizing_source = "oof_tuned"
+    else:
+        tuned_cfg = config.fixed_sizing
+        tuned_pos, tuned_info = apply_sizing(oof_preds, tuned_cfg)
+        tune_info = {
+            "mode": str(tuned_cfg.mode),
+            "baseline": float(tuned_cfg.baseline),
+            "alpha": float(tuned_cfg.alpha),
+            "lambda": float(tuned_cfg.lam),
+            "theta": float(tuned_cfg.theta),
+            "tau_quantile": float(tuned_cfg.tau_quantile),
+            "allow_short": bool(tuned_cfg.allow_short),
+            "grid_best_sharpe": float(sharpe(tuned_pos * y_aligned)),
+            "flat_long_sharpe": float(sharpe(y_aligned * config.target_scale)),
+            "grid_size": 0,
+            "fixed": True,
+            **tuned_info,
+        }
+        sizing_source = "fixed_from_config"
     _log(
         "sizing",
         f"tuned: mode={tuned_cfg.mode} alpha={tuned_cfg.alpha} "
@@ -697,6 +718,8 @@ def run_pipeline(
         "tuned_lambda": float(tuned_cfg.lam),
         "tuned_theta": float(tuned_cfg.theta),
         "tuned_tau_quantile": float(tuned_cfg.tau_quantile),
+        "tuned_allow_short": bool(tuned_cfg.allow_short),
+        "sizing_source": sizing_source,
         "tune_info": tune_info,
         "hmm_n_states": int(hmm_bundle_for_diag.n_states),
         "hmm_covariance_type": str(hmm_bundle_for_diag.model.covariance_type),

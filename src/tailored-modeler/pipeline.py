@@ -57,6 +57,7 @@ class TailoredConfig:
     target_scale: float = 1.0
     clip_quantile: float = 0.999
     run_adversarial: bool = True
+    fixed_sizing: Optional[SizingConfig] = None
 
 
 @dataclass
@@ -122,13 +123,33 @@ def run_pipeline(
     )
 
     # ---- Auto-tune the Sharpe-aware sizer on OOF --------------------------
-    tuned_cfg, tune_info = tune_sizing(
-        oof_preds,
-        y_tr,
-        fold_groups=fold_groups,
-        target_scale=config.target_scale,
-        clip_quantile=config.clip_quantile,
-    )
+    if config.fixed_sizing is None:
+        tuned_cfg, tune_info = tune_sizing(
+            oof_preds,
+            y_tr,
+            fold_groups=fold_groups,
+            target_scale=config.target_scale,
+            clip_quantile=config.clip_quantile,
+        )
+        sizing_source = "oof_tuned"
+    else:
+        tuned_cfg = config.fixed_sizing
+        tuned_pos, tuned_info = apply_sizing(oof_preds, tuned_cfg)
+        tune_info = {
+            "mode": str(tuned_cfg.mode),
+            "baseline": float(tuned_cfg.baseline),
+            "alpha": float(tuned_cfg.alpha),
+            "lambda": float(tuned_cfg.lam),
+            "theta": float(tuned_cfg.theta),
+            "tau_quantile": float(tuned_cfg.tau_quantile),
+            "allow_short": bool(tuned_cfg.allow_short),
+            "grid_best_sharpe": float(sharpe(tuned_pos * y_tr)),
+            "flat_long_sharpe": float(sharpe(y_tr * config.target_scale)),
+            "grid_size": 0,
+            "fixed": True,
+            **tuned_info,
+        }
+        sizing_source = "fixed_from_config"
 
     # Compute supplementary OOF diagnostics.
     oof_positions, _ = apply_sizing(oof_preds, tuned_cfg)
@@ -197,10 +218,14 @@ def run_pipeline(
         "n_train_sessions": int(len(feats_tr)),
         "n_test_sessions": int(len(feats_te)),
         "n_features": int(len(feat_cols)),
+        "n_news_features": int(sum(1 for c in feat_cols if c.startswith("news_"))),
         "cv_splits": int(config.cv_splits),
         "cv_repeats": int(config.cv_repeats),
         "sample_weight_enabled": bool(config.sample_weights.enabled),
         "use_news": bool(config.news.enabled),
+        "news_headline_hash_features": int(config.news.headline_hash_features),
+        "news_half_life": float(config.news.decay_half_life),
+        "news_late_window": int(config.news.late_window),
         "train_R_mean": float(np.mean(y_tr)),
         "train_R_std": float(np.std(y_tr, ddof=0)),
         "oof_sharpe_tuned": float(oof_kelly_sharpe),
@@ -213,6 +238,8 @@ def run_pipeline(
         "tuned_lambda": float(tuned_cfg.lam),
         "tuned_theta": float(tuned_cfg.theta),
         "tuned_tau_quantile": float(tuned_cfg.tau_quantile),
+        "tuned_allow_short": bool(tuned_cfg.allow_short),
+        "sizing_source": sizing_source,
         "tune_info": tune_info,
         "cv_median_best_iters": cv_best_iters,
         "final_train_size": int(len(X_tr)),

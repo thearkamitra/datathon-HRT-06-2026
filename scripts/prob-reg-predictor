@@ -46,6 +46,7 @@ for _p in (_PR_DIR,):
 from heads import HeadsConfig  # noqa: E402
 from paths import data_dir as default_data_dir, submissions_dir as default_sub_dir  # noqa: E402
 from pipeline import NewsConfig, ProbRegConfig, run_pipeline  # noqa: E402
+from pipeline import SizingConfig  # noqa: E402
 
 
 def _parse_args() -> argparse.Namespace:
@@ -121,6 +122,30 @@ def _parse_args() -> argparse.Namespace:
     )
 
     p.add_argument("--ranking-out", type=Path, default=None, help="Optional ranking frame dump path.")
+    p.add_argument(
+        "--fixed-sizing-in",
+        type=Path,
+        default=None,
+        help="Optional JSON file containing a fixed sizing config to reuse instead of OOF tuning.",
+    )
+    p.add_argument(
+        "--diagnostics-out",
+        type=Path,
+        default=None,
+        help="Optional path to dump diagnostics JSON.",
+    )
+    p.add_argument(
+        "--tag",
+        type=str,
+        default="prob-reg",
+        help="Prefix tag used in the output submission filename.",
+    )
+    p.add_argument(
+        "--submission-out",
+        type=Path,
+        default=None,
+        help="Optional exact output path for the submission CSV.",
+    )
     return p.parse_args()
 
 
@@ -156,12 +181,16 @@ def main() -> None:
         target_scale=float(args.target_scale),
         clip_quantile=float(args.clip_quantile),
     )
+    if args.fixed_sizing_in is not None:
+        sizing_payload = json.loads(Path(args.fixed_sizing_in).read_text(encoding="utf-8"))
+        cfg.fixed_sizing = SizingConfig(**sizing_payload)
 
     result = run_pipeline(data_dir, cfg)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    tag = "prob-reg-news" if news_cfg.enabled else "prob-reg"
-    out_path = submissions_dir / f"{tag}_submission_{timestamp}.csv"
+    safe_tag = args.tag.replace(" ", "-").replace("/", "-")
+    out_path = Path(args.submission_out) if args.submission_out is not None else submissions_dir / f"{safe_tag}_submission_{timestamp}.csv"
+    out_path.parent.mkdir(parents=True, exist_ok=True)
     result.submission.to_csv(out_path, index=False)
 
     print(f"Wrote {len(result.submission)} rows to {out_path}")
@@ -169,6 +198,11 @@ def main() -> None:
     diag["tuned_sizing"] = dataclasses.asdict(result.tuned_sizing)
     print("Diagnostics:")
     print(json.dumps(diag, indent=2, default=float))
+    if args.diagnostics_out is not None:
+        dp = Path(args.diagnostics_out)
+        dp.parent.mkdir(parents=True, exist_ok=True)
+        dp.write_text(json.dumps(diag, indent=2, default=float) + "\n", encoding="utf-8")
+        print(f"Diagnostics dumped to {dp.resolve()}")
 
     if args.ranking_out is not None:
         rp = Path(args.ranking_out)

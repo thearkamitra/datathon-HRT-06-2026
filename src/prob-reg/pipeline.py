@@ -126,6 +126,7 @@ class ProbRegConfig:
     news: NewsConfig = field(default_factory=lambda: NewsConfig(enabled=True))
     target_scale: float = 1.0
     clip_quantile: float = 0.999
+    fixed_sizing: Optional[SizingConfig] = None
 
 
 @dataclass
@@ -207,12 +208,32 @@ def run_pipeline(
     oof = run_heteroskedastic_cv(X_tr, y_tr, sessions_tr, cfg=config.heads)
 
     # ---- Tune the Sharpe-aware sizer on the OOF sizing frame -------------
-    tuned_cfg, tune_info = tune_sizing(
-        oof.oof_sizing_frame,
-        y_tr,
-        target_scale=config.target_scale,
-        clip_quantile=config.clip_quantile,
-    )
+    if config.fixed_sizing is None:
+        tuned_cfg, tune_info = tune_sizing(
+            oof.oof_sizing_frame,
+            y_tr,
+            target_scale=config.target_scale,
+            clip_quantile=config.clip_quantile,
+        )
+        sizing_source = "oof_tuned"
+    else:
+        tuned_cfg = config.fixed_sizing
+        tuned_pos, tuned_info = apply_sizing(oof.oof_sizing_frame, tuned_cfg)
+        tune_info = {
+            "mode": str(tuned_cfg.mode),
+            "baseline": float(tuned_cfg.baseline),
+            "alpha": float(tuned_cfg.alpha),
+            "lambda": float(tuned_cfg.lam),
+            "theta": float(tuned_cfg.theta),
+            "tau_quantile": float(tuned_cfg.tau_quantile),
+            "allow_short": bool(tuned_cfg.allow_short),
+            "grid_best_sharpe": float(sharpe(tuned_pos * y_tr)),
+            "flat_long_sharpe": float(sharpe(y_tr * config.target_scale)),
+            "grid_size": 0,
+            "fixed": True,
+            **tuned_info,
+        }
+        sizing_source = "fixed_from_config"
     oof_positions, _ = apply_sizing(oof.oof_sizing_frame, tuned_cfg)
     oof_sharpe = sharpe(oof_positions * y_tr)
     flat_sharpe = sharpe(y_tr * config.target_scale)
@@ -288,6 +309,7 @@ def run_pipeline(
         "tuned_theta": float(tuned_cfg.theta),
         "tuned_tau_quantile": float(tuned_cfg.tau_quantile),
         "tuned_allow_short": bool(tuned_cfg.allow_short),
+        "sizing_source": sizing_source,
         "tune_info": tune_info,
         "heads": {
             "mean_regularizer": config.heads.mean_regularizer,
